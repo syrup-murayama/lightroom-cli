@@ -1808,4 +1808,10 @@ function CatalogModule.getDevelopPresets(params, callback)
     }))
 end
 
+function CatalogModule.getPath(params, callback)
+    local catalog = LrApplication.activeCatalog()
+    local path = catalog:getPath()
+    callback(ErrorUtils.createSuccess({ path = path }))
+end
+
 return CatalogModule
