@@ -283,34 +283,16 @@ function ExportModule.exportWithPreset(params, callback)
         return
     end
 
-    -- 非 ASCII パスへの移動
-    if finalOutputDir and tempOutputDir then
-        if not createDirectoryOrError(finalOutputDir, "OUTPUT_DIR_ERROR") then return end
-        local movedPaths = {}
-        for _, srcPath in ipairs(exportedPaths) do
-            local leaf = LrPathUtils.leafName(srcPath)
-            local dstPath = LrPathUtils.child(finalOutputDir, leaf)
-            local moveOk, moveErr = LrFileUtils.move(srcPath, dstPath)
-            if moveOk then
-                table.insert(movedPaths, dstPath)
-            else
-                local message = "move failed: " .. tostring(srcPath) .. " -> " .. tostring(dstPath) .. ": " .. tostring(moveErr)
-                logger:error(message)
-                callback({ error = { code = "MOVE_ERROR", message = message } })
-                return
-            end
-        end
-        exportedPaths = movedPaths
-        -- 一時ディレクトリを削除
-        LrFileUtils.delete(tempOutputDir)
-    end
-
+    -- 非 ASCII パスの場合は移動を Python 側に委譲
+    -- staging dir パスと最終パスを返し、Python が shutil.move で処理する
     logger:info("exportWithPreset: exported " .. #exportedPaths .. ", skipped " .. skippedCount)
     callback({ result = {
-        exported   = exportedPaths,
-        count      = #exportedPaths,
-        skipped    = skippedCount,
-        presetName = presetName,
+        exported      = exportedPaths,
+        count         = #exportedPaths,
+        skipped       = skippedCount,
+        presetName    = presetName,
+        stagingDir    = tempOutputDir,
+        finalOutputDir = finalOutputDir,
     }})
 end
 
