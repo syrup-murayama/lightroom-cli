@@ -1216,6 +1216,53 @@ _register(
         response_fields=["presets", "count"],
     ),
     CommandSchema(
+        "catalog.listExportPresets",
+        "catalog.export-presets",
+        "List available export presets in Lightroom",
+        params=[
+            ParamSchema(
+                "query",
+                ParamType.STRING,
+                description="Search query to filter presets by name or folder (case-insensitive)",
+            ),
+        ],
+        response_fields=["presets", "count"],
+    ),
+    CommandSchema(
+        "catalog.exportWithPreset",
+        "catalog.export",
+        "Export photos using a named export preset",
+        params=[
+            ParamSchema(
+                "photoIds",
+                ParamType.JSON_ARRAY,
+                required=True,
+                description="Array of photo ID strings to export",
+            ),
+            ParamSchema(
+                "presetName",
+                ParamType.STRING,
+                required=True,
+                description="Name of the export preset to use (obtain via catalog.listExportPresets)",
+            ),
+            ParamSchema(
+                "outputDir",
+                ParamType.STRING,
+                description="Override output directory (absolute path). If omitted, preset destination is used.",
+            ),
+            ParamSchema(
+                "dryRun",
+                ParamType.BOOLEAN,
+                default=False,
+                description="If true, return photo count without exporting",
+            ),
+        ],
+        mutating=True,
+        timeout=600.0,
+        supports_dry_run=True,
+        response_fields=["exported", "count", "skipped", "presetName"],
+    ),
+    CommandSchema(
         "catalog.getKeywords",
         "catalog.keywords",
         "List keywords in catalog",

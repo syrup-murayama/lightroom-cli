@@ -172,6 +172,16 @@ local function loadPhase4Modules()
         return false
     end
 
+    -- Load ExportModule (optional — continue without it if unavailable)
+    local ExportModule
+    success, ExportModule = LrTasks.pcall(require, 'ExportModule')
+    if success then
+        _G.LightroomPythonBridge.ExportModule = ExportModule
+        Logger:info("ExportModule loaded successfully")
+    else
+        Logger:error("Failed to load ExportModule: " .. tostring(ExportModule))
+    end
+
     -- Load SelectionModule
     success, SelectionModule = LrTasks.pcall(require, 'SelectionModule')
     if success then
@@ -414,6 +424,14 @@ local function registerApiCommands()
         router:register("selection.extendSelection", SelectionModule.extendSelection, "sync")
         router:register("selection.deselectActive", SelectionModule.deselectActive, "sync")
         router:register("selection.deselectOthers", SelectionModule.deselectOthers, "sync")
+    end
+
+    -- Export module commands
+    local ExportModule = _G.LightroomPythonBridge.ExportModule
+    if ExportModule then
+        Logger:info("Registering export commands...")
+        router:register("catalog.listExportPresets", ExportModule.listExportPresets, "sync")
+        router:register("catalog.exportWithPreset",  ExportModule.exportWithPreset,  "sync")
     end
 
     Logger:info("Phase 4: API wrapper commands registered successfully")
