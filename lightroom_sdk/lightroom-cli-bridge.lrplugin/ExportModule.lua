@@ -8,6 +8,7 @@ local LrTasks           = import 'LrTasks'
 local LrFunctionContext = import 'LrFunctionContext'
 local LrPathUtils       = import 'LrPathUtils'
 local LrFileUtils       = import 'LrFileUtils'
+local LrDate            = import 'LrDate'
 
 local ExportModule = {}
 
@@ -199,11 +200,59 @@ function ExportModule.exportWithPreset(params, callback)
     end
 
     -- outputDir が指定された場合は宛先を上書き
+    -- LrExportSession は非 ASCII パスを受け付けないため、
+    -- ASCII 以外の文字を含む場合は Pictures 下に ASCII 一時ディレクトリを作り
+    -- 書き出し後に最終パスへ移動する。
+    local finalOutputDir = nil
+    local tempOutputDir  = nil
+
+    local function hasNonAscii(s)
+        for i = 1, #s do
+            if s:byte(i) > 127 then return true end
+        end
+        return false
+    end
+
+    local function createDirectoryOrError(path, code)
+        local createdOk, createErr = LrFileUtils.createAllDirectories(path)
+        if createdOk then return true end
+        if LrFileUtils.exists(path) == "directory" then return true end
+        callback({ error = {
+            code    = code,
+            message = "Failed to create directory: " .. tostring(path) .. ": " .. tostring(createErr),
+        }})
+        return false
+    end
+
+    local function makeAsciiStagingDir()
+        local pictures = LrPathUtils.getStandardFilePath("pictures")
+        if not pictures or pictures == "" then
+            local home = LrPathUtils.getStandardFilePath("home")
+            pictures = LrPathUtils.child(home, "Pictures")
+        end
+
+        local stamp = tostring(math.floor(LrDate.currentTime() * 1000))
+        local candidate = LrPathUtils.child(pictures, "lrwf_stg_" .. stamp)
+        return LrFileUtils.chooseUniqueFileName(candidate)
+    end
+
     if outputDir then
-        exportSettings.LR_export_destinationType        = "specificFolder"
-        exportSettings.LR_export_destinationPathPrefix  = outputDir
-        exportSettings.LR_export_destinationPathSuffix  = ""
-        exportSettings.LR_export_useSubfolder           = false
+        if not hasNonAscii(outputDir) then
+            if not createDirectoryOrError(outputDir, "OUTPUT_DIR_ERROR") then return end
+            exportSettings.LR_export_destinationType        = "specificFolder"
+            exportSettings.LR_export_destinationPathPrefix  = outputDir
+            exportSettings.LR_export_destinationPathSuffix  = ""
+            exportSettings.LR_export_useSubfolder           = false
+        else
+            -- 非 ASCII パス: Pictures 下に ASCII 一時ディレクトリを作成
+            tempOutputDir = makeAsciiStagingDir()
+            if not createDirectoryOrError(tempOutputDir, "STAGING_DIR_ERROR") then return end
+            finalOutputDir = outputDir
+            exportSettings.LR_export_destinationType        = "specificFolder"
+            exportSettings.LR_export_destinationPathPrefix  = tempOutputDir
+            exportSettings.LR_export_destinationPathSuffix  = ""
+            exportSettings.LR_export_useSubfolder           = false
+        end
     end
 
     -- LrExportSession で書き出し
@@ -232,6 +281,28 @@ function ExportModule.exportWithPreset(params, callback)
     if not ok then
         callback({ error = { code = "EXPORT_ERROR", message = tostring(err) } })
         return
+    end
+
+    -- 非 ASCII パスへの移動
+    if finalOutputDir and tempOutputDir then
+        if not createDirectoryOrError(finalOutputDir, "OUTPUT_DIR_ERROR") then return end
+        local movedPaths = {}
+        for _, srcPath in ipairs(exportedPaths) do
+            local leaf = LrPathUtils.leafName(srcPath)
+            local dstPath = LrPathUtils.child(finalOutputDir, leaf)
+            local moveOk, moveErr = LrFileUtils.move(srcPath, dstPath)
+            if moveOk then
+                table.insert(movedPaths, dstPath)
+            else
+                local message = "move failed: " .. tostring(srcPath) .. " -> " .. tostring(dstPath) .. ": " .. tostring(moveErr)
+                logger:error(message)
+                callback({ error = { code = "MOVE_ERROR", message = message } })
+                return
+            end
+        end
+        exportedPaths = movedPaths
+        -- 一時ディレクトリを削除
+        LrFileUtils.delete(tempOutputDir)
     end
 
     logger:info("exportWithPreset: exported " .. #exportedPaths .. ", skipped " .. skippedCount)

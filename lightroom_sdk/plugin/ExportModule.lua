@@ -8,6 +8,7 @@ local LrTasks           = import 'LrTasks'
 local LrFunctionContext = import 'LrFunctionContext'
 local LrPathUtils       = import 'LrPathUtils'
 local LrFileUtils       = import 'LrFileUtils'
+local LrDate            = import 'LrDate'
 
 local ExportModule = {}
 
@@ -32,23 +33,31 @@ local function getExportPresetsDir()
 end
 
 -- .lrtemplate ファイルから export settings テーブルを読み込む
+-- .lrtemplate は "s = { value = {...}, ... }" と書いて return しない形式のため、
+-- グローバル s を一時的に捕捉して読む。
 local function loadPresetSettings(presetPath)
     local chunk, err = loadfile(presetPath)
     if not chunk then
-        -- fallback: io.open で読んで load()
         local f = io.open(presetPath, "r")
         if not f then return nil, "Cannot open: " .. presetPath end
         local src = f:read("*all")
         f:close()
-        chunk = load(src) or loadstring(src)
+        chunk = loadstring(src) or load(src)
         if not chunk then return nil, "Parse error: " .. tostring(err) end
     end
-    local ok, result = pcall(chunk)
-    if not ok or type(result) ~= "table" then
-        return nil, "Invalid preset format: " .. tostring(result)
+    -- グローバル s を保存して上書き実行し、読み取る
+    local prev_s = rawget(_G, "s")
+    rawset(_G, "s", nil)
+    local ok, pcall_err = pcall(chunk)
+    local preset_data = rawget(_G, "s")
+    rawset(_G, "s", prev_s)
+    if not ok then
+        return nil, "Execution error: " .. tostring(pcall_err)
     end
-    if result.value then return result.value, nil end
-    return nil, "Preset has no value table"
+    if type(preset_data) == "table" and preset_data.value then
+        return preset_data.value, nil
+    end
+    return nil, "Invalid preset format: s.value not found (got " .. type(preset_data) .. ")"
 end
 
 -- presetsDir 以下を走査してプリセット一覧を構築
@@ -137,10 +146,15 @@ function ExportModule.exportWithPreset(params, callback)
     end
 
     if not presetPath then
+        -- デバッグ: 実際に見つかった名前を列挙
+        local foundNames = {}
+        for _, r in ipairs(all) do
+            table.insert(foundNames, r.name)
+        end
         callback({ error = {
             code    = "PRESET_NOT_FOUND",
-            message = "Export preset not found: " .. presetName
-                .. ". Use catalog.listExportPresets to see available presets.",
+            message = "Export preset not found: [" .. presetName .. "] len=" .. #presetName
+                .. ". Found presets: " .. table.concat(foundNames, " | "),
         }})
         return
     end
@@ -186,11 +200,59 @@ function ExportModule.exportWithPreset(params, callback)
     end
 
     -- outputDir が指定された場合は宛先を上書き
+    -- LrExportSession は非 ASCII パスを受け付けないため、
+    -- ASCII 以外の文字を含む場合は Pictures 下に ASCII 一時ディレクトリを作り
+    -- 書き出し後に最終パスへ移動する。
+    local finalOutputDir = nil
+    local tempOutputDir  = nil
+
+    local function hasNonAscii(s)
+        for i = 1, #s do
+            if s:byte(i) > 127 then return true end
+        end
+        return false
+    end
+
+    local function createDirectoryOrError(path, code)
+        local createdOk, createErr = LrFileUtils.createAllDirectories(path)
+        if createdOk then return true end
+        if LrFileUtils.exists(path) == "directory" then return true end
+        callback({ error = {
+            code    = code,
+            message = "Failed to create directory: " .. tostring(path) .. ": " .. tostring(createErr),
+        }})
+        return false
+    end
+
+    local function makeAsciiStagingDir()
+        local pictures = LrPathUtils.getStandardFilePath("pictures")
+        if not pictures or pictures == "" then
+            local home = LrPathUtils.getStandardFilePath("home")
+            pictures = LrPathUtils.child(home, "Pictures")
+        end
+
+        local stamp = tostring(math.floor(LrDate.currentTime() * 1000))
+        local candidate = LrPathUtils.child(pictures, "lrwf_stg_" .. stamp)
+        return LrFileUtils.chooseUniqueFileName(candidate)
+    end
+
     if outputDir then
-        exportSettings.LR_export_destinationType        = "specificFolder"
-        exportSettings.LR_export_destinationPathPrefix  = outputDir
-        exportSettings.LR_export_destinationPathSuffix  = ""
-        exportSettings.LR_export_useSubfolder           = false
+        if not hasNonAscii(outputDir) then
+            if not createDirectoryOrError(outputDir, "OUTPUT_DIR_ERROR") then return end
+            exportSettings.LR_export_destinationType        = "specificFolder"
+            exportSettings.LR_export_destinationPathPrefix  = outputDir
+            exportSettings.LR_export_destinationPathSuffix  = ""
+            exportSettings.LR_export_useSubfolder           = false
+        else
+            -- 非 ASCII パス: Pictures 下に ASCII 一時ディレクトリを作成
+            tempOutputDir = makeAsciiStagingDir()
+            if not createDirectoryOrError(tempOutputDir, "STAGING_DIR_ERROR") then return end
+            finalOutputDir = outputDir
+            exportSettings.LR_export_destinationType        = "specificFolder"
+            exportSettings.LR_export_destinationPathPrefix  = tempOutputDir
+            exportSettings.LR_export_destinationPathSuffix  = ""
+            exportSettings.LR_export_useSubfolder           = false
+        end
     end
 
     -- LrExportSession で書き出し
@@ -199,10 +261,10 @@ function ExportModule.exportWithPreset(params, callback)
 
     local ok, err = LrTasks.pcall(function()
         LrFunctionContext.callWithContext("exportWithPreset", function(_context)
-            local session = LrExportSession.new({
+            local session = LrExportSession {
                 photosToExport = photos,
                 exportSettings = exportSettings,
-            })
+            }
             for _, rendition in session:renditions() do
                 local success, pathOrMessage = rendition:waitForRender()
                 if success then
@@ -219,6 +281,28 @@ function ExportModule.exportWithPreset(params, callback)
     if not ok then
         callback({ error = { code = "EXPORT_ERROR", message = tostring(err) } })
         return
+    end
+
+    -- 非 ASCII パスへの移動
+    if finalOutputDir and tempOutputDir then
+        if not createDirectoryOrError(finalOutputDir, "OUTPUT_DIR_ERROR") then return end
+        local movedPaths = {}
+        for _, srcPath in ipairs(exportedPaths) do
+            local leaf = LrPathUtils.leafName(srcPath)
+            local dstPath = LrPathUtils.child(finalOutputDir, leaf)
+            local moveOk, moveErr = LrFileUtils.move(srcPath, dstPath)
+            if moveOk then
+                table.insert(movedPaths, dstPath)
+            else
+                local message = "move failed: " .. tostring(srcPath) .. " -> " .. tostring(dstPath) .. ": " .. tostring(moveErr)
+                logger:error(message)
+                callback({ error = { code = "MOVE_ERROR", message = message } })
+                return
+            end
+        end
+        exportedPaths = movedPaths
+        -- 一時ディレクトリを削除
+        LrFileUtils.delete(tempOutputDir)
     end
 
     logger:info("exportWithPreset: exported " .. #exportedPaths .. ", skipped " .. skippedCount)
