@@ -277,7 +277,7 @@ class SocketBridge:
 
         try:
             # Send request
-            request_json = json.dumps(request) + "\n"
+            request_json = json.dumps(request, ensure_ascii=False) + "\n"
             self._send_writer.write(request_json.encode("utf-8"))
             await self._send_writer.drain()
 
