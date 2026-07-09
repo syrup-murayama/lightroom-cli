@@ -1317,6 +1317,93 @@ function CatalogModule.applyDevelopPreset(params, callback)
     end
 end
 
+-- Apply a develop preset to multiple photos in a single batch write (SDK 15.3+)
+function CatalogModule.applyDevelopPresetBatch(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    if not params or not params.presetName then
+        callback(ErrorUtils.createError("MISSING_PARAM", "presetName is required"))
+        return
+    end
+
+    local photoIds = params.photoIds
+    if not photoIds or type(photoIds) ~= "table" or #photoIds == 0 then
+        callback(ErrorUtils.createError("MISSING_PHOTO_IDS", "photoIds array is required"))
+        return
+    end
+
+    if #photoIds > 50 then
+        callback(ErrorUtils.createError("BATCH_SIZE_EXCEEDED", "Maximum batch size is 50 photos"))
+        return
+    end
+
+    local presetName = params.presetName
+    local presetAmount = params.presetAmount
+    local updateAISettings = params.updateAISettings or false
+
+    logger:debug("Batch applying develop preset: " .. presetName)
+
+    -- Search for the preset by name across all folders
+    local targetPreset = nil
+    local folders = LrApplication.developPresetFolders()
+    for _, folder in ipairs(folders) do
+        local presets = folder:getDevelopPresets()
+        for _, preset in ipairs(presets) do
+            if preset:getName() == presetName then
+                targetPreset = preset
+                break
+            end
+        end
+        if targetPreset then break end
+    end
+
+    if not targetPreset then
+        callback(ErrorUtils.createError("PRESET_NOT_FOUND",
+            "Develop preset not found: " .. presetName))
+        return
+    end
+
+    local catalog = LrApplication.activeCatalog()
+
+    local photos = {}
+    local missingPhotoIds = {}
+    for _, photoId in ipairs(photoIds) do
+        local photo = catalog:getPhotoByLocalId(tonumber(photoId))
+        if photo then
+            table.insert(photos, photo)
+        else
+            table.insert(missingPhotoIds, photoId)
+        end
+    end
+
+    if #photos == 0 then
+        callback(ErrorUtils.createError("PHOTO_NOT_FOUND", "None of the specified photos were found"))
+        return
+    end
+
+    logger:info("Batch applying develop preset '" .. presetName .. "' to " .. #photos .. " photos")
+
+    local writeSuccess, writeError = ErrorUtils.safeCall(function()
+        catalog:withWriteAccessDo("Batch Apply Develop Preset", function()
+            catalog:applyDevelopPreset(photos, targetPreset, nil, presetAmount, updateAISettings)
+        end, { timeout = 60 })
+    end)
+
+    if writeSuccess then
+        callback(ErrorUtils.createSuccess({
+            presetName = presetName,
+            requested = #photoIds,
+            applied = #photos,
+            missingPhotoIds = next(missingPhotoIds) and missingPhotoIds or nil,
+            message = "Develop preset applied to " .. #photos .. " photos"
+        }))
+    else
+        callback(ErrorUtils.createError("OPERATION_FAILED",
+            "Failed to batch apply develop preset: " .. tostring(writeError)))
+    end
+end
+
 -- Create a develop snapshot
 function CatalogModule.createDevelopSnapshot(params, callback)
     ensureLrModules()

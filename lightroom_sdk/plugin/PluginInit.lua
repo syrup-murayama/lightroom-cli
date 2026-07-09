@@ -212,7 +212,7 @@ local function registerSystemCommands()
             result = {
                 pong = true,
                 timestamp = os.time(),
-                version = "1.2.1",
+                version = "1.2.2",
                 protocolVersion = "1"
             }
         })
@@ -372,6 +372,7 @@ local function registerApiCommands()
     router:register("catalog.setCaption", CatalogModule.setCaption, "sync")
     router:register("catalog.setColorLabel", CatalogModule.setColorLabel, "sync")
     router:register("catalog.applyDevelopPreset", CatalogModule.applyDevelopPreset, "sync")
+    router:register("catalog.applyDevelopPresetBatch", CatalogModule.applyDevelopPresetBatch, "sync")
     router:register("catalog.createDevelopSnapshot", CatalogModule.createDevelopSnapshot, "sync")
     router:register("catalog.copySettings", CatalogModule.copySettings, "sync")
     router:register("catalog.pasteSettings", CatalogModule.pasteSettings, "sync")

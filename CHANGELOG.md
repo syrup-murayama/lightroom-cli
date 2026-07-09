@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **`develop preset-batch`** — apply a develop preset to multiple photos in a single batch write via `LrCatalog:applyDevelopPreset` (SDK 15.3+, `--photo-ids`, `--preset`, `--preset-amount`, `--update-ai-settings`)
+
 ## [1.2.2] - 2026-04-06
 
 ### Fixed

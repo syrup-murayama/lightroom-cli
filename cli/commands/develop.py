@@ -149,6 +149,52 @@ def preset(ctx, preset_name, dry_run, **kwargs):
     execute_command(ctx, "catalog.applyDevelopPreset", {"presetName": preset_name})
 
 
+@develop.command("preset-batch")
+@click.option("--photo-ids", required=True, help="Comma-separated photo IDs")
+@click.option("--preset", "preset_name", required=True, help="Develop preset name")
+@click.option("--preset-amount", default=None, type=float, help="Preset amount 0-200 (optional)")
+@click.option(
+    "--update-ai-settings",
+    is_flag=True,
+    default=False,
+    help="Auto-update AI settings after applying (optional)",
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def preset_batch(ctx, photo_ids, preset_name, preset_amount, update_ai_settings, dry_run, **kwargs):
+    """Apply a develop preset to multiple photos in a single batch (SDK 15.3+)"""
+    from lightroom_sdk.retry import calculate_batch_timeout
+
+    try:
+        ids = [int(pid.strip()) for pid in photo_ids.split(",") if pid.strip()]
+    except ValueError:
+        fmt = ctx.obj.get("output", "text") if ctx.obj else "text"
+        click.echo(
+            OutputFormatter.format_error("Invalid photo ID (must be integers)", fmt, code="VALIDATION_ERROR"),
+            err=True,
+        )
+        ctx.exit(2)
+        return
+    if len(ids) > 50:
+        fmt = ctx.obj.get("output", "text") if ctx.obj else "text"
+        click.echo(
+            OutputFormatter.format_error("Maximum batch size is 50 photos", fmt, code="BATCH_SIZE_EXCEEDED"),
+            err=True,
+        )
+        ctx.exit(2)
+        return
+
+    params = {"photoIds": ids, "presetName": preset_name}
+    if preset_amount is not None:
+        params["presetAmount"] = preset_amount
+    if update_ai_settings:
+        params["updateAISettings"] = True
+
+    dynamic_timeout = calculate_batch_timeout(len(ids))
+    execute_command(ctx, "catalog.applyDevelopPresetBatch", params, timeout=dynamic_timeout)
+
+
 @develop.command("snapshot")
 @click.argument("name")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")

@@ -379,3 +379,80 @@ def test_cli_develop_batch_set_exceeds_limit(runner):
     ids = ",".join(str(i) for i in range(1, 52))
     result = runner.invoke(cli, ["develop", "batch-set", "--photo-ids", ids, "Exposure", "0.5"])
     assert result.exit_code != 0
+
+
+@patch("cli.helpers.get_bridge")
+def test_cli_develop_preset_batch(mock_get_bridge, runner):
+    """lr develop preset-batch --photo-ids 1,2,3 --preset "Web書き出し用" の CLI テスト"""
+    mock_bridge = AsyncMock()
+    mock_bridge.send_command.return_value = {
+        "id": "batch-preset-1",
+        "success": True,
+        "result": {"presetName": "Web書き出し用", "requested": 3, "applied": 3},
+    }
+    mock_get_bridge.return_value = mock_bridge
+
+    result = runner.invoke(
+        cli, ["develop", "preset-batch", "--photo-ids", "1,2,3", "--preset", "Web書き出し用"]
+    )
+    assert result.exit_code == 0
+    mock_bridge.send_command.assert_called_once_with(
+        "catalog.applyDevelopPresetBatch",
+        {"photoIds": [1, 2, 3], "presetName": "Web書き出し用"},
+        timeout=30.0,  # 3 photos → max(30, 10+2*3) = 30
+    )
+
+
+@patch("cli.helpers.get_bridge")
+def test_cli_develop_preset_batch_with_options(mock_get_bridge, runner):
+    """--preset-amount / --update-ai-settings が params に反映されること"""
+    mock_bridge = AsyncMock()
+    mock_bridge.send_command.return_value = {
+        "id": "batch-preset-2",
+        "success": True,
+        "result": {"presetName": "Web書き出し用", "requested": 2, "applied": 2},
+    }
+    mock_get_bridge.return_value = mock_bridge
+
+    result = runner.invoke(
+        cli,
+        [
+            "develop",
+            "preset-batch",
+            "--photo-ids",
+            "1,2",
+            "--preset",
+            "Web書き出し用",
+            "--preset-amount",
+            "80",
+            "--update-ai-settings",
+        ],
+    )
+    assert result.exit_code == 0
+    mock_bridge.send_command.assert_called_once_with(
+        "catalog.applyDevelopPresetBatch",
+        {
+            "photoIds": [1, 2],
+            "presetName": "Web書き出し用",
+            "presetAmount": 80.0,
+            "updateAISettings": True,
+        },
+        timeout=30.0,
+    )
+
+
+def test_cli_develop_preset_batch_exceeds_limit(runner):
+    """51枚指定時のバリデーションエラー"""
+    ids = ",".join(str(i) for i in range(1, 52))
+    result = runner.invoke(
+        cli, ["develop", "preset-batch", "--photo-ids", ids, "--preset", "Web書き出し用"]
+    )
+    assert result.exit_code != 0
+
+
+def test_cli_develop_preset_batch_invalid_id(runner):
+    """整数でないIDでバリデーションエラー"""
+    result = runner.invoke(
+        cli, ["develop", "preset-batch", "--photo-ids", "1,abc", "--preset", "Web書き出し用"]
+    )
+    assert result.exit_code != 0

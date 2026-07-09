@@ -696,6 +696,43 @@ _register(
         supports_dry_run=True,
     ),
     CommandSchema(
+        "catalog.applyDevelopPresetBatch",
+        "develop.preset-batch",
+        "Apply a develop preset to multiple photos in a single batch (SDK 15.3+)",
+        params=[
+            ParamSchema(
+                "photoIds",
+                ParamType.JSON_ARRAY,
+                required=True,
+                description="Array of photo IDs to apply the preset to (max 50)",
+            ),
+            ParamSchema(
+                "presetName",
+                ParamType.STRING,
+                required=True,
+                description="Preset name to apply",
+            ),
+            ParamSchema(
+                "presetAmount",
+                ParamType.FLOAT,
+                required=False,
+                description="Preset amount 0-200 (optional, defaults to 100)",
+                min=0,
+                max=200,
+            ),
+            ParamSchema(
+                "updateAISettings",
+                ParamType.BOOLEAN,
+                required=False,
+                description="Auto-update AI settings after applying (optional)",
+            ),
+        ],
+        mutating=True,
+        timeout=120.0,
+        supports_dry_run=True,
+        response_fields=["presetName", "requested", "applied", "missingPhotoIds"],
+    ),
+    CommandSchema(
         "catalog.createDevelopSnapshot",
         "develop.snapshot",
         "Create a develop snapshot",
