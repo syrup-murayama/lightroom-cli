@@ -22,6 +22,9 @@ COMMAND_TIMEOUTS: dict[str, float] = {
     # Batch develop commands (fallback fixed values; use calculate_batch_timeout for dynamic)
     "develop.batchApplySettings": 120.0,
     "develop.batchSetValue": 120.0,
+    "catalog.batchSetFlag": 120.0,
+    "catalog.batchRemoveKeywords": 120.0,
+    "catalog.batchAddKeywords": 120.0,
 }
 
 DEFAULT_TIMEOUT = 30.0

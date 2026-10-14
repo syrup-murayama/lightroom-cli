@@ -39,7 +39,9 @@ def list_photos(ctx, limit, offset, **kwargs):
 @click.pass_context
 def search(ctx, query, limit, offset, **kwargs):
     """Search photos by keyword"""
-    criteria = {"query": query}
+    # Map the free-text query to the keyword filter (a valid findPhotos key). Sending
+    # {"query": ...} hit no known filter and returned the ENTIRE catalog as "results".
+    criteria = {"keyword": query}
     execute_command(ctx, "catalog.searchPhotos", {"criteria": criteria, "limit": limit, "offset": offset}, timeout=60.0)
 
 
@@ -86,6 +88,163 @@ def set_flag(ctx, photo_id, flag, dry_run, **kwargs):
     execute_command(ctx, "catalog.setFlag", {"photoId": photo_id, "flag": flag_map[flag]})
 
 
+@catalog.command("batch-set-flag")
+@click.option("--photo-ids", required=True, help="Comma-separated photo IDs")
+@click.argument("flag", type=click.Choice(["pick", "reject", "none"]))
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def batch_set_flag(ctx, photo_ids, flag, dry_run, **kwargs):
+    """Set the same flag (pick/reject/none) on multiple photos in one call"""
+    from lightroom_sdk.retry import calculate_batch_timeout
+
+    try:
+        ids = [int(pid.strip()) for pid in photo_ids.split(",") if pid.strip()]
+    except ValueError:
+        fmt = ctx.obj.get("output", "text") if ctx.obj else "text"
+        click.echo(
+            OutputFormatter.format_error("Invalid photo ID (must be integers)", fmt, code="VALIDATION_ERROR"),
+            err=True,
+        )
+        ctx.exit(2)
+        return
+    if len(ids) > 50:
+        fmt = ctx.obj.get("output", "text") if ctx.obj else "text"
+        click.echo(
+            OutputFormatter.format_error("Maximum batch size is 50 photos", fmt, code="BATCH_SIZE_EXCEEDED"),
+            err=True,
+        )
+        ctx.exit(2)
+        return
+    flag_map = {"pick": 1, "reject": -1, "none": 0}
+    dynamic_timeout = calculate_batch_timeout(len(ids))
+    execute_command(
+        ctx,
+        "catalog.batchSetFlag",
+        {"photoIds": ids, "flag": flag_map[flag]},
+        timeout=dynamic_timeout,
+    )
+
+
+def _load_keyword_pairs(path):
+    """Read [[photoId, keywordId], ...] or [{"photoId":..,"keywordId":..}, ...] -> list of dicts, or raise ValueError."""
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list) or not data:
+        raise ValueError("pairs file must hold a non-empty JSON array")
+    pairs = []
+    for i, p in enumerate(data, 1):
+        if isinstance(p, dict):
+            pid, kid = p.get("photoId"), p.get("keywordId")
+        elif isinstance(p, (list, tuple)) and len(p) == 2:
+            pid, kid = p
+        else:
+            raise ValueError(f"pair {i} must be [photoId, keywordId] or an object with photoId and keywordId")
+        if isinstance(pid, bool) or isinstance(kid, bool) or not isinstance(pid, int) or not isinstance(kid, int):
+            raise ValueError(f"pair {i}: photoId and keywordId must be integers")
+        pairs.append({"photoId": pid, "keywordId": kid})
+    return pairs
+
+
+@catalog.command("batch-remove-keywords")
+@click.option(
+    "--pairs-file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help='JSON file: [[photoId, keywordId], ...] or [{"photoId":..,"keywordId":..}, ...] (max 200 distinct pairs)',
+)
+@click.option("--catalog-path", default=None, help="Refuse unless Lightroom has this .lrcat open (ids are per-catalog)")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def batch_remove_keywords(ctx, pairs_file, catalog_path, dry_run, **kwargs):
+    """Remove keywords (by id) from photos: up to 200 photo/keyword pairs in one write.
+
+    Each pair's status (removed / not_on_photo / photo_not_found / still_present / unverified) comes from reading
+    the photo before and after the write; a photo whose keyword count changed by anything else is listed in
+    collateralPhotos. Catalog only; the keyword objects stay. Check `complete` in the result.
+    """
+    _keyword_pairs_command(ctx, pairs_file, catalog_path, kwargs, "catalog.batchRemoveKeywords")
+
+
+@catalog.command("batch-add-keywords")
+@click.option(
+    "--pairs-file",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help='JSON file: [[photoId, keywordId], ...] or [{"photoId":..,"keywordId":..}, ...] (max 200 distinct pairs)',
+)
+@click.option("--catalog-path", default=None, help="Refuse unless Lightroom has this .lrcat open (ids are per-catalog)")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def batch_add_keywords(ctx, pairs_file, catalog_path, dry_run, **kwargs):
+    """Add EXISTING keywords (by id) to photos: up to 200 photo/keyword pairs in one write.
+
+    Never creates a keyword: an id not in the catalog is keyword_not_found (unlike batch-set --keyword, which goes
+    by name and creates a missing one). Each pair's status (added / already_on_photo / photo_not_found /
+    keyword_not_found / not_added / unverified) comes from reading the photo before and after the write; a photo
+    whose keyword count changed by anything else is listed in collateralPhotos. Catalog only. Check `complete`.
+    """
+    _keyword_pairs_command(ctx, pairs_file, catalog_path, kwargs, "catalog.batchAddKeywords")
+
+
+@catalog.command("probe-photo")
+@click.argument("photo_id")
+@json_input_options
+@click.pass_context
+def probe_photo(ctx, photo_id, **kwargs):
+    """DIAGNOSTIC, read-only: run each step of looking a photo up and reading it; report which step fails and how."""
+    execute_command(ctx, "catalog.probePhoto", {"photoId": photo_id})
+
+
+@catalog.command("probe-api")
+@click.option("--keyword-id", type=int, default=None, help="Keyword to probe (default: the first top-level keyword)")
+@json_input_options
+@click.pass_context
+def probe_api(ctx, keyword_id, **kwargs):
+    """DIAGNOSTIC, read-only: list the methods Lightroom exposes on the catalog and on a keyword; never calls them."""
+    params = {} if keyword_id is None else {"keywordId": keyword_id}
+    execute_command(ctx, "catalog.probeApi", params)
+
+
+def _keyword_pairs_command(ctx, pairs_file, catalog_path, kwargs, bridge_command):
+    """Shared body of batch-add-keywords / batch-remove-keywords: read and check the pairs, then send them."""
+    from lightroom_sdk.retry import calculate_batch_timeout
+
+    fmt = ctx.obj.get("output", "text") if ctx.obj else "text"
+    json_given = kwargs.get("json_str") is not None or kwargs.get("json_stdin")
+    if pairs_file is None and not json_given:
+        click.echo(
+            OutputFormatter.format_error("--pairs-file (or --json / --json-stdin) is required", fmt,
+                                         code="VALIDATION_ERROR"),
+            err=True,
+        )
+        ctx.exit(2)
+        return
+    pairs = []
+    if pairs_file is not None:
+        try:
+            pairs = _load_keyword_pairs(pairs_file)
+        except (ValueError, OSError) as e:
+            click.echo(OutputFormatter.format_error(str(e), fmt, code="VALIDATION_ERROR"), err=True)
+            ctx.exit(2)
+            return
+        distinct = {(p["photoId"], p["keywordId"]) for p in pairs}
+        if len(distinct) > 200:
+            click.echo(
+                OutputFormatter.format_error("Maximum batch size is 200 pairs", fmt, code="BATCH_SIZE_EXCEEDED"),
+                err=True,
+            )
+            ctx.exit(2)
+            return
+    # The plugin side allows up to 110 s (CommandRouter); --json input may carry a full 200 pairs, so use the cap.
+    params = {"pairs": pairs}
+    if catalog_path:
+        params["catalogPath"] = catalog_path
+    execute_command(ctx, bridge_command, params, timeout=calculate_batch_timeout(200))
+
+
 @catalog.command("get-flag")
 @click.argument("photo_id")
 @json_input_options
@@ -112,6 +271,7 @@ def get_flag(ctx, photo_id, **kwargs):
 @click.option("--file-format", help="File format (RAW/DNG/JPEG)")
 @click.option("--keyword", "keyword_filter", help="Keyword (substring match)")
 @click.option("--filename", help="Filename (substring match)")
+@click.option("--text", help="Free-text (substring across filename, title, caption)")
 @click.option("--limit", default=50, type=int, help="Max results")
 @click.option("--offset", default=0, type=int, help="Offset for pagination")
 @json_input_options
@@ -129,6 +289,7 @@ def find_photos(
     file_format,
     keyword_filter,
     filename,
+    text,
     limit,
     offset,
     **kwargs,
@@ -156,11 +317,14 @@ def find_photos(
         search_desc["keyword"] = keyword_filter
     if filename:
         search_desc["filename"] = filename
+    if text:
+        search_desc["text"] = text
 
     execute_command(
         ctx,
         "catalog.findPhotos",
         {"searchDesc": search_desc, "limit": limit, "offset": offset},
+        timeout=90.0,
     )
 
 
@@ -181,6 +345,14 @@ def select_photos(ctx, photo_ids, dry_run, **kwargs):
 def find_by_path(ctx, path, **kwargs):
     """Find photo by file path"""
     execute_command(ctx, "catalog.findPhotoByPath", {"path": path})
+
+
+@catalog.command("path")
+@json_input_options
+@click.pass_context
+def catalog_path(ctx, **kwargs):
+    """Get the absolute path of the active catalog (.lrcat)"""
+    execute_command(ctx, "catalog.getPath", {})
 
 
 @catalog.command("collections")
@@ -323,17 +495,114 @@ def create_virtual_copy(ctx, dry_run, **kwargs):
 @click.pass_context
 def set_metadata(ctx, photo_id, key, value, dry_run, **kwargs):
     """Set arbitrary metadata key/value for a photo"""
-    execute_command(ctx, "catalog.setMetadata", {"photoId": photo_id, "key": key, "value": value})
+    from cli.helpers import coerce_scalar
+
+    execute_command(ctx, "catalog.setMetadata", {"photoId": photo_id, "key": key, "value": coerce_scalar(value)})
 
 
 @catalog.command("create-collection")
 @click.argument("name")
+@click.option("--parent", type=int, default=None, help="Parent collection-set ID to nest the new collection under")
+@click.option(
+    "--return-existing/--no-return-existing",
+    default=True,
+    help="Return the existing collection if one with this name already exists",
+)
 @click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
 @json_input_options
 @click.pass_context
-def create_collection(ctx, name, dry_run, **kwargs):
-    """Create a new collection"""
-    execute_command(ctx, "catalog.createCollection", {"name": name})
+def create_collection(ctx, name, parent, return_existing, dry_run, **kwargs):
+    """Create a new collection (returns the new collection id)"""
+    params = {"name": name, "returnExisting": return_existing}
+    if parent is not None:
+        params["parentId"] = parent
+    execute_command(ctx, "catalog.createCollection", params)
+
+
+@catalog.command("add-to-collection")
+@click.argument("collection_id", type=int)
+@click.argument("photo_ids", nargs=-1, required=True)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def add_to_collection(ctx, collection_id, photo_ids, dry_run, **kwargs):
+    """Add photos to a collection by ID"""
+    execute_command(
+        ctx,
+        "catalog.addPhotosToCollection",
+        {"collectionId": collection_id, "photoIds": list(photo_ids)},
+        timeout=60.0,
+    )
+
+
+@catalog.command("remove-from-collection")
+@click.argument("collection_id", type=int)
+@click.argument("photo_ids", nargs=-1, required=True)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def remove_from_collection(ctx, collection_id, photo_ids, dry_run, **kwargs):
+    """Remove photos from a collection by ID (does not delete the photos)"""
+    execute_command(
+        ctx,
+        "catalog.removePhotosFromCollection",
+        {"collectionId": collection_id, "photoIds": list(photo_ids)},
+        timeout=60.0,
+    )
+
+
+@catalog.command("batch-set")
+@click.argument("photo_ids", nargs=-1, required=False)
+@click.option("--rating", type=int, default=None, help="Rating 0-5 (0 clears)")
+@click.option("--color-label", default=None, help="Color label (red/yellow/green/blue/purple/none)")
+@click.option("--flag", type=click.Choice(["pick", "reject", "none"]), default=None, help="Pick flag")
+@click.option("--title", default=None, help="Title, applied to every photo")
+@click.option("--caption", default=None, help="Caption, applied to every photo")
+@click.option("--keyword", "keywords", multiple=True, help="Keyword to add to every photo (repeatable)")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def batch_set(ctx, photo_ids, rating, color_label, flag, title, caption, keywords, dry_run, **kwargs):
+    """Set metadata fields across many photos at once (current selection if no IDs are given)."""
+    params = {}
+    if photo_ids:
+        params["photoIds"] = list(photo_ids)
+    if rating is not None:
+        params["rating"] = rating
+    if color_label:
+        params["colorLabel"] = color_label
+    if flag:
+        params["flag"] = {"pick": 1, "reject": -1, "none": 0}[flag]
+    if title is not None:
+        params["title"] = title
+    if caption is not None:
+        params["caption"] = caption
+    if keywords:
+        params["addKeywords"] = list(keywords)
+    execute_command(ctx, "catalog.batchSetMetadata", params, timeout=60.0)
+
+
+@catalog.command("save-metadata")
+@click.argument("photo_ids", nargs=-1, required=False)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def save_metadata(ctx, photo_ids, dry_run, **kwargs):
+    """Save catalog metadata to each photo's file XMP (current selection if no IDs are given)."""
+    params = {}
+    if photo_ids:
+        params["photoIds"] = list(photo_ids)
+    execute_command(ctx, "catalog.saveMetadata", params, timeout=120.0)
+
+
+@catalog.command("import")
+@click.argument("paths", nargs=-1, required=True)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def import_photos(ctx, paths, dry_run, **kwargs):
+    """Add existing files to the catalog (referenced in place): lr catalog import <path>..."""
+    execute_command(ctx, "catalog.importPhotos", {"paths": list(paths)}, timeout=120.0)
 
 
 @catalog.command("create-smart-collection")
@@ -349,7 +618,8 @@ def create_smart_collection(ctx, name, search_desc, dry_run, **kwargs):
         try:
             params["searchDesc"] = json.loads(search_desc)
         except json.JSONDecodeError as e:
-            click.echo(OutputFormatter.format_error(f"Invalid JSON for --search-desc: {e}"))
+            fmt = ctx.obj.get("output", "text") if ctx.obj else "text"
+            click.echo(OutputFormatter.format_error(f"Invalid JSON for --search-desc: {e}", fmt, code="VALIDATION_ERROR"))
             ctx.exit(1)
             return
     execute_command(ctx, "catalog.createSmartCollection", params)
@@ -357,22 +627,100 @@ def create_smart_collection(ctx, name, search_desc, dry_run, **kwargs):
 
 @catalog.command("create-collection-set")
 @click.argument("name")
+@click.option("--parent", type=int, default=None, help="Parent collection-set ID to nest this set under")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
 @json_input_options
 @click.pass_context
-def create_collection_set(ctx, name, dry_run, **kwargs):
+def create_collection_set(ctx, name, parent, dry_run, **kwargs):
     """Create a collection set"""
-    execute_command(ctx, "catalog.createCollectionSet", {"name": name})
+    params = {"name": name}
+    if parent is not None:
+        params["parentId"] = parent
+    execute_command(ctx, "catalog.createCollectionSet", params)
+
+
+@catalog.command("rename-collection")
+@click.argument("collection_id", type=int)
+@click.argument("new_name")
+@json_input_options
+@click.pass_context
+def rename_collection(ctx, collection_id, new_name, **kwargs):
+    """Rename an existing collection by id"""
+    execute_command(ctx, "catalog.renameCollection", {"collectionId": collection_id, "newName": new_name})
+
+
+@catalog.command("delete-collection")
+@click.argument("collection_id", type=int)
+@json_input_options
+@click.pass_context
+def delete_collection(ctx, collection_id, **kwargs):
+    """Delete a collection or collection set by id (does not touch member photos)"""
+    execute_command(ctx, "catalog.deleteCollection", {"collectionId": collection_id})
 
 
 @catalog.command("create-keyword")
 @click.argument("keyword")
+@click.option("--parent-id", type=int, default=None, help="Create it inside the keyword with this id")
+@click.option("--parent", "parent_name", default=None,
+              help="Create it inside the keyword with this exact name (must name exactly one keyword)")
+@click.option("--no-export", is_flag=True, default=False, help="Create it with 'Include on Export' unchecked")
+@click.option("--catalog-path", default=None, help="Refuse unless Lightroom has this .lrcat open")
+@click.option("--allow-duplicate-name", is_flag=True, default=False,
+              help="Create it even if a keyword with the same name (any capitals) exists elsewhere in the tree")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
 @json_input_options
 @click.pass_context
-def create_keyword(ctx, keyword, dry_run, **kwargs):
-    """Create a keyword in catalog"""
-    execute_command(ctx, "catalog.createKeyword", {"keyword": keyword})
+def create_keyword(ctx, keyword, parent_id, parent_name, no_export, catalog_path, allow_duplicate_name, dry_run,
+                   **kwargs):
+    """Create a keyword, optionally inside an existing parent keyword.
+
+    Give --parent-id or --parent: without one, Lightroom puts the keyword under whatever keyword was last selected in
+    its Keyword List, not at the top level (the response says where it landed). Refuses if the name already exists
+    elsewhere; returns the existing keyword (created=false) if it is already where you asked. Reads back the
+    placement: a keyword that landed outside the requested parent is PLACEMENT_MISMATCH.
+    """
+    params = {"keyword": keyword}
+    if parent_id is not None:
+        params["parentId"] = parent_id
+    if parent_name is not None:
+        params["parent"] = parent_name
+    if no_export:
+        params["includeOnExport"] = False
+    if catalog_path:
+        params["catalogPath"] = catalog_path
+    if allow_duplicate_name:
+        params["allowDuplicateName"] = True
+    execute_command(ctx, "catalog.createKeyword", params)
+
+
+@catalog.command("move-keyword")
+@click.argument("keyword_id", type=int)
+@click.option("--parent-id", type=int, default=None, help="Move it inside the keyword with this id")
+@click.option("--parent", "parent_name", default=None,
+              help="Move it inside the keyword with this exact name (must name exactly one keyword)")
+@click.option("--to-top", is_flag=True, default=False, help="Move it to the top level of the Keyword List")
+@click.option("--catalog-path", default=None, help="Refuse unless Lightroom has this .lrcat open")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def move_keyword(ctx, keyword_id, parent_id, parent_name, to_top, catalog_path, dry_run, **kwargs):
+    """Move a keyword inside another keyword, or to the top level; it keeps its id, photos and children.
+
+    Give exactly one of --parent-id, --parent or --to-top. Afterwards the keyword is re-read by id: it must sit
+    directly in the target with the same photo and child counts, else an error says where it is and what changed.
+    Refuses a target inside the keyword itself, or one already holding a keyword of the same name (any capitals).
+    Already there: moved=false, nothing written. Catalog only.
+    """
+    params = {"keywordId": keyword_id}
+    if parent_id is not None:
+        params["parentId"] = parent_id
+    if parent_name is not None:
+        params["parent"] = parent_name
+    if to_top:
+        params["toTop"] = True
+    if catalog_path:
+        params["catalogPath"] = catalog_path
+    execute_command(ctx, "catalog.moveKeyword", params)
 
 
 @catalog.command("remove-keyword")
@@ -386,6 +734,17 @@ def remove_keyword(ctx, photo_id, keyword, dry_run, **kwargs):
     execute_command(ctx, "catalog.removeKeyword", {"photoId": photo_id, "keyword": keyword})
 
 
+@catalog.command("rename-keyword")
+@click.argument("keyword_id")
+@click.argument("new_name")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def rename_keyword(ctx, keyword_id, new_name, dry_run, **kwargs):
+    """Rename a keyword by id (keeps its photos, faces, and synonyms; catalog only -- Save Metadata writes files)"""
+    execute_command(ctx, "catalog.renameKeyword", {"keywordId": keyword_id, "newName": new_name})
+
+
 @catalog.command("set-view-filter")
 @click.option("--filter", "filter_json", required=True, help="JSON filter descriptor")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
@@ -396,7 +755,8 @@ def set_view_filter(ctx, filter_json, dry_run, **kwargs):
     try:
         filter_data = json.loads(filter_json)
     except json.JSONDecodeError as e:
-        click.echo(OutputFormatter.format_error(f"Invalid JSON for --filter: {e}"))
+        fmt = ctx.obj.get("output", "text") if ctx.obj else "text"
+        click.echo(OutputFormatter.format_error(f"Invalid JSON for --filter: {e}", fmt, code="VALIDATION_ERROR"))
         ctx.exit(1)
         return
     execute_command(ctx, "catalog.setViewFilter", {"filter": filter_data})

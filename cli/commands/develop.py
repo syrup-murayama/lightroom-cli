@@ -2,24 +2,23 @@ import json
 
 import click
 
+from cli.commands.completion import complete_develop_param
 from cli.decorators import json_input_options
-from cli.helpers import execute_command
+from cli.helpers import coerce_scalar, execute_command
 from cli.output import OutputFormatter
 
 
 def _parse_pairs(pairs: tuple) -> dict:
-    """可変長引数 (param, value, param, value, ...) を辞書に変換"""
+    """可変長引数 (param, value, param, value, ...) を辞書に変換。
+
+    値は数値 / true・false / 文字列に型強制する（WhiteBalance='Auto' や
+    ConvertToGrayscale=true のような非数値パラメータも設定できるように）。
+    """
     if len(pairs) % 2 != 0:
         raise click.BadParameter("Parameters must be in 'param value' pairs")
     result = {}
     for i in range(0, len(pairs), 2):
-        try:
-            result[pairs[i]] = float(pairs[i + 1])
-        except ValueError:
-            raise click.BadParameter(
-                f"Invalid numeric value '{pairs[i + 1]}' for parameter '{pairs[i]}'. "
-                f"Expected a number (e.g., 0.5, -1.0, 100)"
-            )
+        result[pairs[i]] = coerce_scalar(pairs[i + 1])
     return result
 
 
@@ -44,7 +43,7 @@ def get_settings(ctx, photo_id, **kwargs):
 
 
 @develop.command("set")
-@click.argument("pairs", nargs=-1, required=True)
+@click.argument("pairs", nargs=-1, required=True, shell_complete=complete_develop_param)
 @click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
 @json_input_options
 @click.pass_context
@@ -67,6 +66,114 @@ def set_values(ctx, pairs, dry_run, **kwargs):
         execute_command(ctx, "develop.setValue", {"param": param, "value": value})
 
 
+@develop.command("batch-apply")
+@click.argument("photo_ids", nargs=-1, required=False)
+@click.option("--set", "settings_pairs", multiple=True, help="Setting as Param=Value (repeatable)")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def batch_apply(ctx, photo_ids, settings_pairs, dry_run, **kwargs):
+    """Apply develop settings to many photos: batch-apply <ids...> --set Exposure=0.5 --set Contrast=20"""
+    if not settings_pairs:
+        raise click.BadParameter("at least one --set Param=Value is required", param_hint="--set")
+    settings = {}
+    for pair in settings_pairs:
+        if "=" not in pair:
+            raise click.BadParameter(f"--set must be Param=Value, got '{pair}'", param_hint="--set")
+        key, value = pair.split("=", 1)
+        settings[key.strip()] = coerce_scalar(value)
+    params = {"settings": settings}
+    if photo_ids:
+        params["photoIds"] = list(photo_ids)
+    execute_command(ctx, "develop.batchApplySettings", params, timeout=60.0)
+
+
+@develop.group("mask")
+def mask():
+    """Masking: create / combine / invert / delete develop masks on the active photo."""
+    pass
+
+
+def _mask_geometry_opts(func):
+    func = click.option("--type", "mask_type", default="brush", help="Mask type (brush, linearGradient, radialGradient, rangeMask, ...)")(func)
+    func = click.option("--subtype", default=None, help="Mask subtype (type-specific)")(func)
+    func = click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")(func)
+    return func
+
+
+def _mask_geometry_params(mask_type, subtype):
+    params = {"maskType": mask_type}
+    if subtype:
+        params["maskSubtype"] = subtype
+    return params
+
+
+@mask.command("create")
+@_mask_geometry_opts
+@json_input_options
+@click.pass_context
+def mask_create(ctx, mask_type, subtype, dry_run, **kwargs):
+    """Create a new mask on the active photo."""
+    execute_command(ctx, "develop.createNewMask", _mask_geometry_params(mask_type, subtype))
+
+
+@mask.command("ai")
+@click.option(
+    "--selection",
+    "selection_type",
+    type=click.Choice(["subject", "sky", "background", "objects", "people", "landscape"]),
+    default="subject",
+    help="AI selection type",
+)
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def mask_ai(ctx, selection_type, dry_run, **kwargs):
+    """Create an AI selection mask (subject/sky/background/objects/people/landscape)."""
+    execute_command(ctx, "develop.createAISelectionMask", {"selectionType": selection_type})
+
+
+@mask.command("add")
+@_mask_geometry_opts
+@json_input_options
+@click.pass_context
+def mask_add(ctx, mask_type, subtype, dry_run, **kwargs):
+    """Add a component to the current mask (union)."""
+    execute_command(ctx, "develop.addToCurrentMask", _mask_geometry_params(mask_type, subtype))
+
+
+@mask.command("subtract")
+@_mask_geometry_opts
+@json_input_options
+@click.pass_context
+def mask_subtract(ctx, mask_type, subtype, dry_run, **kwargs):
+    """Subtract a component from the current mask."""
+    execute_command(ctx, "develop.subtractFromCurrentMask", _mask_geometry_params(mask_type, subtype))
+
+
+@mask.command("intersect")
+@_mask_geometry_opts
+@json_input_options
+@click.pass_context
+def mask_intersect(ctx, mask_type, subtype, dry_run, **kwargs):
+    """Intersect a component with the current mask."""
+    execute_command(ctx, "develop.intersectWithCurrentMask", _mask_geometry_params(mask_type, subtype))
+
+
+# NOTE: develop.invertMask / develop.deleteMask require a maskId, but createNewMask doesn't return a
+# usable one (live smoke 2026-06-20: MISSING_MASK_ID). Until a maskId source exists they'd be dead
+# commands, so they stay unexposed (orphan-allowlisted). v2: have create return an id / target current.
+
+
+@mask.command("activate")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
+@json_input_options
+@click.pass_context
+def mask_activate(ctx, dry_run, **kwargs):
+    """Switch the develop module into masking mode."""
+    execute_command(ctx, "develop.activateMaskingMode", {})
+
+
 @develop.command("auto-tone")
 @click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
 @json_input_options
@@ -77,7 +184,7 @@ def auto_tone(ctx, dry_run, **kwargs):
 
 
 @develop.command("get")
-@click.argument("parameter")
+@click.argument("parameter", shell_complete=complete_develop_param)
 @json_input_options
 @click.pass_context
 def get_value(ctx, parameter, **kwargs):
@@ -224,7 +331,7 @@ def paste_settings(ctx, dry_run, **kwargs):
 
 
 @develop.command("range")
-@click.argument("param")
+@click.argument("param", shell_complete=complete_develop_param)
 @json_input_options
 @click.pass_context
 def get_range(ctx, param, **kwargs):
@@ -233,7 +340,7 @@ def get_range(ctx, param, **kwargs):
 
 
 @develop.command("reset-param")
-@click.argument("param")
+@click.argument("param", shell_complete=complete_develop_param)
 @click.option("--dry-run", is_flag=True, default=False, help="Preview without executing")
 @json_input_options
 @click.pass_context
@@ -363,13 +470,7 @@ def curve_remove_point(ctx, index, channel, dry_run, **kwargs):
     )
 
 
-# --- Masking commands ---
-
-
-@develop.group()
-def mask():
-    """Masking commands"""
-    pass
+# --- Masking commands (view/query; geometry ops are defined with the `mask` group above) ---
 
 
 @mask.command("list")

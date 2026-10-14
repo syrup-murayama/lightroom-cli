@@ -7,6 +7,9 @@ local LrApplication = nil
 local LrTasks = import 'LrTasks'
 local LrDate = nil
 local LrProgressScope = nil
+local LrExportSession = nil
+local LrFileUtils = nil
+local LrPathUtils = nil
 
 -- Get ErrorUtils from global state (created in PluginInit.lua)
 local function getErrorUtils()
@@ -39,6 +42,15 @@ local function ensureLrModules()
         if success and dateModule then
             LrDate = dateModule
         end
+    end
+    if not LrFileUtils then
+        LrFileUtils = import 'LrFileUtils'
+    end
+    if not LrPathUtils then
+        LrPathUtils = import 'LrPathUtils'
+    end
+    if not LrExportSession then
+        LrExportSession = import 'LrExportSession'
     end
 end
 
@@ -222,6 +234,17 @@ function CatalogModule.getPhotoMetadata(params, callback)
     end)
 end
 
+-- Resolve the effective selection from the catalog's target photo(s).
+-- LrCatalog:getTargetPhotos() returns the WHOLE FILMSTRIP when nothing is selected, so
+-- gate on getTargetPhoto() (singular, the active photo): nil => nothing is truly selected.
+-- Pure + side-effect-free so it is unit-testable without a live Lightroom.
+function CatalogModule._resolveSelection(targetPhoto, targetPhotos)
+    if targetPhoto == nil then
+        return {}
+    end
+    return targetPhotos or {}
+end
+
 -- Get current selection
 function CatalogModule.getSelectedPhotos(params, callback)
     local wrappedCallback = ErrorUtils.wrapCallback(callback, "getSelectedPhotos")
@@ -240,11 +263,21 @@ function CatalogModule.getSelectedPhotos(params, callback)
     local catalog = LrApplication.activeCatalog()
     
     catalog:withReadAccessDo(function()
-        local selectedSuccess, selectedPhotos = ErrorUtils.safeCall(function()
+        local targetPhotoSuccess, targetPhoto = ErrorUtils.safeCall(function()
+            return catalog:getTargetPhoto()
+        end)
+        local selectedSuccess, targetPhotos = ErrorUtils.safeCall(function()
             return catalog:getTargetPhotos()
         end)
-        
-        if not selectedSuccess or not selectedPhotos or #selectedPhotos == 0 then
+
+        -- getTargetPhotos() is the whole filmstrip when nothing is selected; gate on the
+        -- singular active photo so "get selected" never reports the entire catalog.
+        local selectedPhotos = CatalogModule._resolveSelection(
+            (targetPhotoSuccess and targetPhoto) or nil,
+            (selectedSuccess and targetPhotos) or nil
+        )
+
+        if #selectedPhotos == 0 then
             wrappedCallback(ErrorUtils.createSuccess({
                 photos = {},
                 count = 0
@@ -354,7 +387,7 @@ end
 function CatalogModule.getAllPhotos(params, callback)
     ensureLrModules()
     local logger = getLogger()
-    local limit = params.limit or 1000  -- Default limit to prevent memory issues
+    local limit = math.min(math.max(tonumber(params.limit) or 1000, 1), 2000)  -- default 1000, capped to prevent memory exhaustion
     local offset = params.offset or 0
     
     logger:debug("Getting all photos from catalog")
@@ -457,8 +490,26 @@ end
 local KNOWN_FILTER_KEYS = {
     flag = true, rating = true, ratingOp = true, colorLabel = true, camera = true,
     folderPath = true, captureDateFrom = true, captureDateTo = true,
-    fileFormat = true, keyword = true, filename = true,
+    fileFormat = true, keyword = true, filename = true, text = true,
 }
+
+-- Returns a sorted list of filter keys in searchDesc that are not recognized, or nil
+-- if all are known. Pure (no SDK) so it is unit-testable. findPhotos uses this to fail
+-- closed: an unknown key must NOT fall through to an empty predicate that matches every
+-- photo (that returned the entire catalog as a "search result" -- the legacy `search`
+-- path sent {query=...}).
+function CatalogModule._unknownFilterKeys(searchDesc)
+    if type(searchDesc) ~= "table" then return nil end
+    local unknown = {}
+    for key, _ in pairs(searchDesc) do
+        if not KNOWN_FILTER_KEYS[key] then
+            table.insert(unknown, tostring(key))
+        end
+    end
+    if #unknown == 0 then return nil end
+    table.sort(unknown)
+    return unknown
+end
 
 -- Chunk processing constants
 local FILTER_CHUNK_SIZE = 50
@@ -567,6 +618,20 @@ local function matchPhoto(photo, searchDesc)
         end
     end
 
+    -- Free-text filter: case-insensitive substring across filename, title, caption. Uses RAW metadata
+    -- (filename = basename of the raw path) so a full-catalog scan stays fast. Keyword text is the
+    -- separate indexed `keyword` filter -- scanning keyword names per photo would dominate the cost.
+    if searchDesc.text and searchDesc.text ~= "" then
+        local needle = string.lower(searchDesc.text)
+        local path = photo:getRawMetadata("path") or ""
+        local fname = path:match("[^\\/]+$") or ""
+        if not (string.find(string.lower(fname), needle, 1, true)
+            or string.find(string.lower(photo:getRawMetadata("title") or ""), needle, 1, true)
+            or string.find(string.lower(photo:getRawMetadata("caption") or ""), needle, 1, true)) then
+            return false
+        end
+    end
+
     -- Keyword filter (substring match on keyword names)
     if searchDesc.keyword then
         local keywords = photo:getRawMetadata("keywords") or {}
@@ -584,6 +649,48 @@ local function matchPhoto(photo, searchDesc)
     return true
 end
 
+-- Pure: recursively collect every keyword whose name contains `substr` (case-insensitive).
+-- Each element responds to :getName() and optionally :getChildren(). Unit-testable.
+function CatalogModule._collectKeywordsMatching(keywords, substr)
+    local matches = {}
+    if type(keywords) ~= "table" or substr == nil then return matches end
+    local needle = string.lower(substr)
+    local function visit(list)
+        for _, kw in ipairs(list) do
+            if kw.getName and string.find(string.lower(kw:getName()), needle, 1, true) then
+                table.insert(matches, kw)
+            end
+            if kw.getChildren then
+                local children = kw:getChildren()
+                if children then visit(children) end
+            end
+        end
+    end
+    visit(keywords)
+    return matches
+end
+
+-- Candidate photos for a keyword substring via the keyword INDEX (keyword:getPhotos),
+-- de-duplicated by localIdentifier. Avoids scanning the whole catalog for keyword
+-- searches -- a keyword filter on a 30k+ catalog otherwise full-scans and exceeds the
+-- command timeout (#9). Uses only SDK methods already proven in this module.
+local function getKeywordCandidatePhotos(catalog, substr)
+    local seen, photos = {}, {}
+    catalog:withReadAccessDo(function()
+        local matched = CatalogModule._collectKeywordsMatching(catalog:getKeywords(), substr)
+        for _, kw in ipairs(matched) do
+            for _, photo in ipairs(kw:getPhotos()) do
+                local id = photo.localIdentifier
+                if not seen[id] then
+                    seen[id] = true
+                    table.insert(photos, photo)
+                end
+            end
+        end
+    end)
+    return photos
+end
+
 -- Advanced photo search with criteria
 function CatalogModule.findPhotos(params, callback)
     ensureLrModules()
@@ -594,13 +701,22 @@ function CatalogModule.findPhotos(params, callback)
 
     logger:debug("Finding photos with search criteria")
 
-    -- Validate: check for unknown filter keys
-    local warnings = {}
-    for key, _ in pairs(searchDesc) do
-        if not KNOWN_FILTER_KEYS[key] then
-            table.insert(warnings, "Unknown filter key: " .. tostring(key))
-        end
+    -- Validate: fail closed on unknown filter keys. An unrecognized key must NOT
+    -- silently match every photo -- that returned the entire catalog as a "search
+    -- result" (the legacy `search` path sent {query=...}).
+    local unknownKeys = CatalogModule._unknownFilterKeys(searchDesc)
+    if unknownKeys then
+        callback({
+            error = {
+                code = "INVALID_PARAM",
+                message = "Unknown filter key(s): " .. table.concat(unknownKeys, ", ")
+                    .. ". Valid keys: flag, rating, ratingOp, colorLabel, camera, folderPath, "
+                    .. "captureDateFrom, captureDateTo, fileFormat, keyword, filename."
+            }
+        })
+        return
     end
+    local warnings = {}
 
     -- Validate: rating must be a number
     if searchDesc.rating ~= nil and type(searchDesc.rating) ~= "number" then
@@ -622,11 +738,29 @@ function CatalogModule.findPhotos(params, callback)
     local router = getCommandRouter()
     local streamMode = params._stream == true and router ~= nil and requestId ~= nil
 
-    -- Step 1: Get all photos (lightweight, no chunking needed)
+    -- Step 1: Get candidate photos. For keyword searches use the keyword INDEX
+    -- (keyword:getPhotos) instead of scanning every photo -- a keyword filter on a
+    -- 30k+ catalog otherwise full-scans and exceeds the command timeout (#9). Other
+    -- filters still scan.
+    local usingKeywordIndex = type(searchDesc.keyword) == "string" and searchDesc.keyword ~= ""
     local allPhotos
-    catalog:withReadAccessDo(function()
-        allPhotos = catalog:getAllPhotos()
-    end)
+    if usingKeywordIndex then
+        allPhotos = getKeywordCandidatePhotos(catalog, searchDesc.keyword)
+    else
+        catalog:withReadAccessDo(function()
+            allPhotos = catalog:getAllPhotos()
+        end)
+    end
+
+    -- The keyword-index candidates already satisfy the keyword predicate, so drop it from
+    -- the per-photo match -- re-reading every candidate's keywords was the slow step.
+    local matchDesc = searchDesc
+    if usingKeywordIndex then
+        matchDesc = {}
+        for k, v in pairs(searchDesc) do
+            if k ~= "keyword" then matchDesc[k] = v end
+        end
+    end
 
     if not allPhotos or #allPhotos == 0 then
         callback({
@@ -656,7 +790,7 @@ function CatalogModule.findPhotos(params, callback)
         local chunkOk, chunkErr = LrTasks.pcall(function()
             catalog:withReadAccessDo(function()
                 for i = chunkStart, chunkEnd do
-                    if matchPhoto(allPhotos[i], searchDesc) then
+                    if matchPhoto(allPhotos[i], matchDesc) then
                         table.insert(filtered, allPhotos[i])
                     end
                 end
@@ -774,6 +908,29 @@ function CatalogModule.findPhotos(params, callback)
 end
 
 -- Get collections in catalog
+-- Pure: recursively collect every collection from a node (catalog or collection set),
+-- descending through child collection sets. Each node responds to :getChildCollections()
+-- and :getChildCollectionSets(). Returns a flat array of collection objects. Unit-testable.
+-- Fixes collections nested inside collection sets being unreachable (#163).
+function CatalogModule._collectAllCollections(node)
+    local result = {}
+    if node == nil then return result end
+    local function visit(n)
+        if n.getChildCollections then
+            for _, c in ipairs(n:getChildCollections()) do
+                table.insert(result, c)
+            end
+        end
+        if n.getChildCollectionSets then
+            for _, s in ipairs(n:getChildCollectionSets()) do
+                visit(s)
+            end
+        end
+    end
+    visit(node)
+    return result
+end
+
 function CatalogModule.getCollections(params, callback)
     ensureLrModules()
     local logger = getLogger()
@@ -785,7 +942,7 @@ function CatalogModule.getCollections(params, callback)
 
     local collections
     catalog:withReadAccessDo(function()
-        collections = catalog:getChildCollections()
+        collections = CatalogModule._collectAllCollections(catalog)
     end)
 
     local resultCollections = {}
@@ -800,6 +957,17 @@ function CatalogModule.getCollections(params, callback)
                     name = collection:getName(),
                     type = collection:type(),
                 }
+                -- [SDK-VERIFY] LrCollection:getParent() -- mirrors the folder:getParent() pattern
+                -- already used elsewhere in this module; nil parent means top-level (not inside
+                -- any collection set). First live call is the real verification.
+                local parent = collection:getParent()
+                if parent then
+                    entry.parentId = parent.localIdentifier
+                    entry.parentName = parent:getName()
+                else
+                    entry.parentId = nil
+                    entry.parentName = nil
+                end
                 if includePhotoCounts then
                     entry.photoCount = #collection:getPhotos()
                 end
@@ -1054,6 +1222,40 @@ function CatalogModule.setRating(params, callback)
 end
 
 -- Add keywords to photo (Gap C fix)
+-- Recursively find an existing keyword by exact name in a keyword list (each element
+-- responds to :getName() and optionally :getChildren()). Returns the keyword or nil.
+-- Pure (no catalog access) so it is unit-testable. addKeywords uses it to reuse an
+-- existing keyword object instead of catalog:createKeyword(name, {}, false, nil, true),
+-- whose parent-scoped reuse is unreliable and silently spawns duplicate keyword objects.
+function CatalogModule._findKeywordByName(keywords, name)
+    if type(keywords) ~= "table" or name == nil then return nil end
+    for _, kw in ipairs(keywords) do
+        if kw.getName and kw:getName() == name then
+            return kw
+        end
+        if kw.getChildren then
+            local found = CatalogModule._findKeywordByName(kw:getChildren(), name)
+            if found then return found end
+        end
+    end
+    return nil
+end
+
+-- Pure: find a keyword by its localIdentifier anywhere in the tree (incl. nested). Unit-testable.
+function CatalogModule._findKeywordById(keywords, id)
+    if type(keywords) ~= "table" or id == nil then return nil end
+    for _, kw in ipairs(keywords) do
+        if kw.localIdentifier == id then
+            return kw
+        end
+        if kw.getChildren then
+            local found = CatalogModule._findKeywordById(kw:getChildren(), id)
+            if found then return found end
+        end
+    end
+    return nil
+end
+
 function CatalogModule.addKeywords(params, callback)
     ensureLrModules()
     local logger = getLogger()
@@ -1075,8 +1277,18 @@ function CatalogModule.addKeywords(params, callback)
         catalog:withWriteAccessDo("Add Keywords", function()
             local photo = catalog:getPhotoByLocalId(tonumber(photoId))
             if not photo then error("Photo not found: " .. tostring(photoId)) end
+            -- Reuse existing keyword objects (whole tree); only create when truly absent.
+            -- catalog:createKeyword(parent=nil, returnIfExists) is parent-scoped and
+            -- unreliable, so calling it blindly spawns duplicate keyword objects.
+            local existingKeywords = catalog:getKeywords()
+            local createdThisCall = {}
             for _, kwName in ipairs(keywords) do
-                local keyword = catalog:createKeyword(kwName, {}, false, nil, true)
+                local keyword = createdThisCall[kwName]
+                    or CatalogModule._findKeywordByName(existingKeywords, kwName)
+                if not keyword then
+                    keyword = catalog:createKeyword(kwName, {}, false, nil, true)
+                    createdThisCall[kwName] = keyword
+                end
                 if keyword then
                     photo:addKeyword(keyword)
                     table.insert(addedKeywords, kwName)
@@ -1090,6 +1302,224 @@ function CatalogModule.addKeywords(params, callback)
     else
         callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to add keywords: " .. tostring(writeError)))
     end
+end
+
+-- Apply metadata fields (rating/colorLabel/flag/title/caption/addKeywords) to many photos in one
+-- write transaction (one undo step). Photos resolved by id list or the current selection (filmstrip-
+-- guarded). Per-photo continue-on-error; keyword objects resolved/created once for the whole batch.
+function CatalogModule.batchSetMetadata(params, callback)
+    ensureLrModules()
+    params = params or {}
+    local hasKeywords = type(params.addKeywords) == "table" and #params.addKeywords > 0
+    local hasField = params.rating ~= nil or params.colorLabel ~= nil or params.flag ~= nil
+        or params.title ~= nil or params.caption ~= nil or hasKeywords
+    if not hasField then
+        callback(ErrorUtils.createError("INVALID_PARAM_VALUE",
+            "Provide at least one field to set (rating/colorLabel/flag/title/caption/addKeywords)"))
+        return
+    end
+    -- Fail fast on bad scalar values (match the single setters' guards)
+    if params.rating ~= nil then
+        local rv = tonumber(params.rating)
+        if rv == nil or rv < 0 or rv > 5 then
+            callback(ErrorUtils.createError("INVALID_PARAM_VALUE", "rating must be between 0 and 5"))
+            return
+        end
+    end
+    if params.flag ~= nil then
+        local fv = tonumber(params.flag)
+        if fv ~= 1 and fv ~= -1 and fv ~= 0 then
+            callback(ErrorUtils.createError("INVALID_PARAM_VALUE", "flag must be 1 (pick), -1 (reject), or 0 (none)"))
+            return
+        end
+    end
+
+    local catalog = LrApplication.activeCatalog()
+    local photos, notFound = {}, {}
+    local resolveOk, resolveErr = ErrorUtils.safeCall(function()
+        catalog:withReadAccessDo(function()
+            if params.photoIds and type(params.photoIds) == "table" and #params.photoIds > 0 then
+                for _, pid in ipairs(params.photoIds) do
+                    local p = catalog:getPhotoByLocalId(tonumber(pid))
+                    if p then table.insert(photos, p) else table.insert(notFound, tostring(pid)) end
+                end
+            else
+                photos = CatalogModule._resolveSelection(catalog:getTargetPhoto(), catalog:getTargetPhotos())
+            end
+        end)
+    end)
+    if not resolveOk then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to resolve photos: " .. tostring(resolveErr)))
+        return
+    end
+    if #photos == 0 then
+        callback(ErrorUtils.createError("PHOTO_NOT_FOUND", "No photos to update (empty selection and no valid photoIds)"))
+        return
+    end
+
+    local succeeded, failed, results = 0, 0, {}
+    local writeOk, writeErr = ErrorUtils.safeCall(function()
+        catalog:withWriteAccessDo("Batch Set Metadata", function()
+            -- Resolve/create keyword objects ONCE for the whole batch (reuse-or-create per addKeywords).
+            local keywordObjs = {}
+            if hasKeywords then
+                local existing = catalog:getKeywords()
+                local created = {}
+                for _, kwName in ipairs(params.addKeywords) do
+                    local kw = created[kwName] or CatalogModule._findKeywordByName(existing, kwName)
+                    if not kw then kw = catalog:createKeyword(kwName, {}, false, nil, true); created[kwName] = kw end
+                    if kw then table.insert(keywordObjs, kw) end
+                end
+            end
+            for _, photo in ipairs(photos) do
+                local pid = tostring(photo.localIdentifier)
+                local ok, err = ErrorUtils.safeCall(function()
+                    if params.rating ~= nil then
+                        local rv = tonumber(params.rating)
+                        if rv == 0 then rv = nil end  -- LR: setRawMetadata("rating", 0) throws
+                        photo:setRawMetadata("rating", rv)
+                    end
+                    if params.colorLabel ~= nil then photo:setRawMetadata("colorNameForLabel", params.colorLabel) end
+                    if params.flag ~= nil then photo:setRawMetadata("pickStatus", tonumber(params.flag)) end
+                    if params.title ~= nil then photo:setRawMetadata("title", params.title) end
+                    if params.caption ~= nil then photo:setRawMetadata("caption", params.caption) end
+                    for _, kw in ipairs(keywordObjs) do photo:addKeyword(kw) end
+                end)
+                if ok then
+                    succeeded = succeeded + 1
+                    table.insert(results, { photoId = pid, success = true })
+                else
+                    failed = failed + 1
+                    table.insert(results, { photoId = pid, success = false, error = tostring(err) })
+                end
+            end
+        end, { timeout = 30 })
+    end)
+    if not writeOk then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to set metadata: " .. tostring(writeErr)))
+        return
+    end
+
+    for _, pid in ipairs(notFound) do
+        failed = failed + 1
+        table.insert(results, { photoId = pid, success = false, error = "Photo not found" })
+    end
+
+    callback(ErrorUtils.createSuccess({
+        total = #results, succeeded = succeeded, failed = failed, results = results,
+    }))
+end
+
+-- Save catalog metadata to each photo's file (XMP). Photos by id list or current selection.
+-- The READ direction (re-read file -> catalog) is intentionally NOT exposed: it overwrites catalog
+-- edits with file values, which is unsafe when LR is the source of truth and auto-write-XMP is on.
+function CatalogModule.saveMetadata(params, callback)
+    ensureLrModules()
+    params = params or {}
+    local catalog = LrApplication.activeCatalog()
+    local photos, notFound = {}, {}
+    local resolveOk, resolveErr = ErrorUtils.safeCall(function()
+        catalog:withReadAccessDo(function()
+            if params.photoIds and type(params.photoIds) == "table" and #params.photoIds > 0 then
+                for _, pid in ipairs(params.photoIds) do
+                    local p = catalog:getPhotoByLocalId(tonumber(pid))
+                    if p then table.insert(photos, p) else table.insert(notFound, tostring(pid)) end
+                end
+            else
+                photos = CatalogModule._resolveSelection(catalog:getTargetPhoto(), catalog:getTargetPhotos())
+            end
+        end)
+    end)
+    if not resolveOk then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to resolve photos: " .. tostring(resolveErr)))
+        return
+    end
+    if #photos == 0 then
+        callback(ErrorUtils.createError("PHOTO_NOT_FOUND", "No photos to save (empty selection and no valid photoIds)"))
+        return
+    end
+
+    local succeeded, failed, results = 0, 0, {}
+    for _, photo in ipairs(photos) do
+        local pid = tostring(photo.localIdentifier)
+        local ok, err = ErrorUtils.safeCall(function()
+            photo:saveMetadata()  -- [SDK-VERIFY] writes catalog metadata to the file's XMP
+        end)
+        if ok then
+            succeeded = succeeded + 1
+            table.insert(results, { photoId = pid, success = true })
+        else
+            failed = failed + 1
+            table.insert(results, { photoId = pid, success = false, error = tostring(err) })
+        end
+        LrTasks.yield()
+    end
+
+    for _, pid in ipairs(notFound) do
+        failed = failed + 1
+        table.insert(results, { photoId = pid, success = false, error = "Photo not found" })
+    end
+
+    callback(ErrorUtils.createSuccess({
+        total = #results, succeeded = succeeded, failed = failed, results = results,
+    }))
+end
+
+-- Import (add) existing files into the catalog via catalog:addPhoto. Paths must exist on disk; files
+-- are referenced in place (not copied). Per-path partial success; new photo ids are read AFTER the
+-- write txn (same SDK restriction as createCollection: can't read a just-added photo in the same txn).
+function CatalogModule.importPhotos(params, callback)
+    ensureLrModules()
+    params = params or {}
+    local paths = params.paths
+    if type(paths) ~= "table" or #paths == 0 then
+        callback(ErrorUtils.createError("INVALID_PARAM_VALUE", "paths must be a non-empty array"))
+        return
+    end
+
+    local catalog = LrApplication.activeCatalog()
+    local results, imported, failed = {}, 0, 0
+    local addedPhotos = {}  -- resultIndex -> LrPhoto (ids read after the write commits)
+
+    local writeOk, writeErr = ErrorUtils.safeCall(function()
+        catalog:withWriteAccessDo("Import Photos", function()
+            for _, path in ipairs(paths) do
+                local p = tostring(path)
+                if not LrFileUtils.exists(p) then
+                    failed = failed + 1
+                    table.insert(results, { path = p, success = false, error = "File not found" })
+                else
+                    local ok, photoOrErr = ErrorUtils.safeCall(function()
+                        return catalog:addPhoto(p)  -- [SDK-VERIFY]
+                    end)
+                    if ok and photoOrErr then
+                        imported = imported + 1
+                        table.insert(results, { path = p, success = true })
+                        addedPhotos[#results] = photoOrErr
+                    else
+                        failed = failed + 1
+                        table.insert(results, { path = p, success = false, error = tostring(photoOrErr) })
+                    end
+                end
+            end
+        end, { timeout = 60 })
+    end)
+    if not writeOk then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Import failed: " .. tostring(writeErr)))
+        return
+    end
+
+    -- Read new photo ids AFTER the write txn commits (best-effort; degrade to no id on failure)
+    ErrorUtils.safeCall(function()
+        catalog:withReadAccessDo(function()
+            for idx, photo in pairs(addedPhotos) do
+                local ok, id = ErrorUtils.safeCall(function() return photo.localIdentifier end)
+                if ok and id and results[idx] then results[idx].photoId = tostring(id) end
+            end
+        end)
+    end)
+
+    callback(ErrorUtils.createSuccess({ total = #results, imported = imported, failed = failed, results = results }))
 end
 
 -- Set photo flag (pick/reject/none)
@@ -1130,6 +1560,63 @@ function CatalogModule.setFlag(params, callback)
         callback(ErrorUtils.createError("OPERATION_FAILED",
             "Failed to set flag: " .. tostring(writeError)))
     end
+end
+
+-- Set the same flag (pick/reject/none) on multiple photos in one call.
+-- Mirrors DevelopModule.batchSetValue's shape (processed/succeeded/results), but skips the
+-- Develop-module switch and per-photo selection that function needs -- pickStatus is catalog
+-- metadata, not a Develop setting, so no active-photo context is required to write it.
+function CatalogModule.batchSetFlag(params, callback)
+    ensureLrModules()
+    local logger = getLogger()
+
+    local photoIds = params and params.photoIds
+    local flag = params and params.flag
+
+    if not photoIds or type(photoIds) ~= "table" or #photoIds == 0 then
+        callback(ErrorUtils.createError("MISSING_PHOTO_IDS", "photoIds array is required"))
+        return
+    end
+    if #photoIds > 50 then
+        callback(ErrorUtils.createError("BATCH_SIZE_EXCEEDED", "Maximum batch size is 50 photos"))
+        return
+    end
+    if flag ~= 1 and flag ~= -1 and flag ~= 0 then
+        callback(ErrorUtils.createError("INVALID_PARAM_VALUE",
+            "flag must be 1 (pick), -1 (reject), or 0 (none)"))
+        return
+    end
+
+    logger:info("Batch setting flag=" .. tostring(flag) .. " on " .. #photoIds .. " photos")
+
+    local catalog = LrApplication.activeCatalog()
+    local results = {}
+    local succeeded = 0
+
+    catalog:withWriteAccessDo("Batch Set Flag", function()
+        for _, photoId in ipairs(photoIds) do
+            local photo = catalog:getPhotoByLocalId(tonumber(photoId))
+            if not photo then
+                table.insert(results, { photoId = photoId, success = false, error = "Photo not found" })
+            else
+                local success, err = ErrorUtils.safeCall(function()
+                    photo:setRawMetadata("pickStatus", flag)
+                end)
+                if success then
+                    succeeded = succeeded + 1
+                    table.insert(results, { photoId = photoId, success = true })
+                else
+                    table.insert(results, { photoId = photoId, success = false, error = tostring(err) })
+                end
+            end
+        end
+    end, { timeout = 30 })
+
+    callback(ErrorUtils.createSuccess({
+        processed = #results,
+        succeeded = succeeded,
+        results = results
+    }))
 end
 
 -- Get photo flag status
@@ -1576,21 +2063,31 @@ function CatalogModule.setMetadata(params, callback)
     end
 
     local catalog = LrApplication.activeCatalog()
-    catalog:withWriteAccessDo("Set Metadata", function()
-        local photo = catalog:getPhotoByLocalId(tonumber(photoId))
-        if not photo then
-            callback(ErrorUtils.createError("PHOTO_NOT_FOUND", "Photo with ID " .. photoId .. " not found"))
-            return
-        end
-        local success, err = ErrorUtils.safeCall(function()
+    -- Mirror the removeKeyword template: capture result/error in outer locals, wrap
+    -- withWriteAccessDo in safeCall, and call back exactly once afterward. The old code
+    -- invoked the callback INSIDE withWriteAccessDo with no safeCall, so a write-access
+    -- timeout sent no response and the client hung to its own timeout.
+    local opResult = nil
+    local opError = nil
+    local writeSuccess, writeErr = ErrorUtils.safeCall(function()
+        catalog:withWriteAccessDo("Set Metadata", function()
+            local photo = catalog:getPhotoByLocalId(tonumber(photoId))
+            if not photo then
+                opError = { code = "PHOTO_NOT_FOUND", message = "Photo with ID " .. tostring(photoId) .. " not found" }
+                return
+            end
             photo:setRawMetadata(key, value)
-        end)
-        if success then
-            callback(ErrorUtils.createSuccess({ photoId = photoId, key = key, value = value, message = "Metadata set" }))
-        else
-            callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to set metadata: " .. tostring(err)))
-        end
-    end, { timeout = 10 })
+            opResult = { photoId = photoId, key = key, value = value, message = "Metadata set" }
+        end, { timeout = 10 })
+    end)
+
+    if opError then
+        callback(ErrorUtils.createError(opError.code, opError.message))
+    elseif writeSuccess and opResult then
+        callback(ErrorUtils.createSuccess(opResult))
+    else
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to set metadata: " .. tostring(writeErr)))
+    end
 end
 
 function CatalogModule.createCollection(params, callback)
@@ -1600,17 +2097,42 @@ function CatalogModule.createCollection(params, callback)
         callback(ErrorUtils.createError("MISSING_PARAM", "Collection name is required"))
         return
     end
+    local returnExisting = (params.returnExisting ~= false)  -- default true
     local catalog = LrApplication.activeCatalog()
+    local coll = nil
+    local opError = nil
     local success, err = ErrorUtils.safeCall(function()
         catalog:withWriteAccessDo("Create Collection", function()
-            catalog:createCollection(name, nil, true)
+            local parent = nil
+            if params.parentId then
+                parent = CatalogModule._findCollectionSetById(catalog, tonumber(params.parentId))
+                if not parent then
+                    opError = { code = "PHOTO_NOT_FOUND", message = "Parent collection set not found: " .. tostring(params.parentId) }
+                    return
+                end
+            end
+            coll = catalog:createCollection(name, parent, returnExisting)
         end, { timeout = 10 })
     end)
-    if success then
-        callback(ErrorUtils.createSuccess({ name = name, message = "Collection created" }))
-    else
-        callback(ErrorUtils.createError("OPERATION_FAILED", tostring(err)))
+    if opError then
+        callback(ErrorUtils.createError(opError.code, opError.message))
+        return
     end
+    if not success then
+        callback(ErrorUtils.createError("OPERATION_FAILED", tostring(err)))
+        return
+    end
+    -- Read the new collection's id AFTER the write txn commits. Reading a just-created collection's
+    -- info inside the same withWriteAccessDo is forbidden by the LrC SDK (live-smoke confirmed).
+    local collectionId = nil
+    if coll then
+        ErrorUtils.safeCall(function()
+            catalog:withReadAccessDo(function()
+                collectionId = coll.localIdentifier
+            end)
+        end)
+    end
+    callback(ErrorUtils.createSuccess({ id = collectionId, name = name, message = "Collection created" }))
 end
 
 function CatalogModule.createSmartCollection(params, callback)
@@ -1642,35 +2164,610 @@ function CatalogModule.createCollectionSet(params, callback)
         return
     end
     local catalog = LrApplication.activeCatalog()
+    local opError = nil
+    local newSet = nil
     local success, err = ErrorUtils.safeCall(function()
         catalog:withWriteAccessDo("Create Collection Set", function()
-            catalog:createCollectionSet(name, nil, true)
+            local parent = nil
+            if params.parentId then
+                parent = CatalogModule._findCollectionSetById(catalog, tonumber(params.parentId))
+                if not parent then
+                    opError = { code = "PHOTO_NOT_FOUND", message = "Parent collection set not found: " .. tostring(params.parentId) }
+                    return
+                end
+            end
+            newSet = catalog:createCollectionSet(name, parent, true)
         end, { timeout = 10 })
     end)
+    if opError then
+        callback(ErrorUtils.createError(opError.code, opError.message))
+        return
+    end
+    if not success then
+        callback(ErrorUtils.createError("OPERATION_FAILED", tostring(err)))
+        return
+    end
+    -- Read the new set's id AFTER the write txn commits -- same restriction as createCollection
+    -- (reading a just-created item's info inside the same withWriteAccessDo is forbidden by the SDK).
+    local setId = nil
+    if newSet then
+        ErrorUtils.safeCall(function()
+            catalog:withReadAccessDo(function()
+                setId = newSet.localIdentifier
+            end)
+        end)
+    end
+    callback(ErrorUtils.createSuccess({ id = setId, name = name, message = "Collection set created" }))
+end
+
+-- Rename an existing collection (not a collection set) by id.
+-- [SDK-VERIFY] LrCollection:setName() -- standard accessor per Adobe's Lua SDK; not previously
+-- exercised anywhere in this plugin, so treat the first live call as the real verification.
+function CatalogModule.renameCollection(params, callback)
+    ensureLrModules()
+    local collectionId = tonumber(params.collectionId)
+    local newName = params.newName
+    if not collectionId then
+        callback(ErrorUtils.createError("MISSING_PARAM", "collectionId is required"))
+        return
+    end
+    if not newName or newName == "" then
+        callback(ErrorUtils.createError("MISSING_PARAM", "newName is required"))
+        return
+    end
+    local catalog = LrApplication.activeCatalog()
+    local opError = nil
+    local oldName = nil
+    local success, err = ErrorUtils.safeCall(function()
+        catalog:withWriteAccessDo("Rename Collection", function()
+            local coll = CatalogModule._findCollectionById(catalog, collectionId)
+            if not coll then
+                opError = { code = "PHOTO_NOT_FOUND", message = "Collection not found: " .. tostring(collectionId) }
+                return
+            end
+            oldName = coll:getName()
+            coll:setName(newName)
+        end, { timeout = 10 })
+    end)
+    if opError then
+        callback(ErrorUtils.createError(opError.code, opError.message))
+        return
+    end
     if success then
-        callback(ErrorUtils.createSuccess({ name = name, message = "Collection set created" }))
+        callback(ErrorUtils.createSuccess({ id = collectionId, oldName = oldName, newName = newName, message = "Collection renamed" }))
     else
         callback(ErrorUtils.createError("OPERATION_FAILED", tostring(err)))
     end
 end
 
-function CatalogModule.createKeyword(params, callback)
+-- Delete a collection OR a collection set by id (tries collection first, falls back to set).
+-- [SDK-VERIFY] LrCollection:delete() / LrCollectionSet:delete() -- standard per Adobe's Lua SDK;
+-- distinct from removing a PHOTO from the catalog, which the SDK genuinely does not support (see
+-- removeFromCatalog above, verified 2026-06-12). Deleting the organizational collection itself
+-- (not the photos inside it) is a different, supported operation. Not previously exercised anywhere
+-- in this plugin, so treat the first live call as the real verification. A collection's member
+-- photos are never touched -- this only removes the collection/set, same as Lightroom's own
+-- right-click Delete on a collection.
+function CatalogModule.deleteCollection(params, callback)
     ensureLrModules()
-    local keyword = params.keyword
-    if not keyword then
-        callback(ErrorUtils.createError("MISSING_PARAM", "Keyword is required"))
+    local itemId = tonumber(params.collectionId)
+    if not itemId then
+        callback(ErrorUtils.createError("MISSING_PARAM", "collectionId is required"))
         return
     end
     local catalog = LrApplication.activeCatalog()
+    local opError = nil
+    local deletedName = nil
+    local deletedType = nil
     local success, err = ErrorUtils.safeCall(function()
-        catalog:withWriteAccessDo("Create Keyword", function()
-            catalog:createKeyword(keyword, {}, true, nil, true)
+        catalog:withWriteAccessDo("Delete Collection", function()
+            local item = CatalogModule._findCollectionById(catalog, itemId)
+            local itemType = "collection"
+            if not item then
+                item = CatalogModule._findCollectionSetById(catalog, itemId)
+                itemType = "collection set"
+            end
+            if not item then
+                opError = { code = "PHOTO_NOT_FOUND", message = "Collection or collection set not found: " .. tostring(itemId) }
+                return
+            end
+            deletedName = item:getName()
+            deletedType = itemType
+            item:delete()
         end, { timeout = 10 })
     end)
+    if opError then
+        callback(ErrorUtils.createError(opError.code, opError.message))
+        return
+    end
     if success then
-        callback(ErrorUtils.createSuccess({ keyword = keyword, message = "Keyword created" }))
+        callback(ErrorUtils.createSuccess({ id = itemId, name = deletedName, type = deletedType, message = "Deleted" }))
     else
         callback(ErrorUtils.createError("OPERATION_FAILED", tostring(err)))
+    end
+end
+
+-- Pure: every keyword named `name` IGNORING CASE, anywhere in the tree, each with the parent it was found under
+-- (nil = top level). The parent comes from the walk itself, not getParent(), whose top-level answer is unverified.
+-- Unit-testable.
+function CatalogModule._findKeywordsNamedCI(keywords, name, parent, out)
+    out = out or {}
+    if type(keywords) ~= "table" or type(name) ~= "string" then return out end
+    local want = name:lower()
+    for _, kw in ipairs(keywords) do
+        local kname = kw.getName and kw:getName()
+        if type(kname) == "string" and kname:lower() == want then
+            table.insert(out, { kw = kw, parent = parent })
+        end
+        if kw.getChildren then
+            CatalogModule._findKeywordsNamedCI(kw:getChildren(), name, kw, out)
+        end
+    end
+    return out
+end
+
+-- Pure: id and name of a parent found by the walk, both nil for the top level. Unit-testable.
+function CatalogModule._placeOf(parent)
+    if parent == nil then return nil, nil end
+    return parent.localIdentifier, parent:getName()
+end
+
+-- catalog.createKeyword -- create a keyword, optionally INSIDE an existing parent keyword (2026-10-06).
+-- Why the parent matters: createKeyword(parent=nil) does not reliably create at the top level -- LrC puts the new
+-- keyword under whatever keyword was last selected in the Keyword List (memory reference_lrc_keyword_sdk_constraints,
+-- seen 2026-04-26); with an EXPLICIT parent it places correctly. So: parentId, or parent = an exact name that must
+-- match exactly one keyword. With neither, the keyword lands wherever LrC puts it and the response says where.
+-- Refuses (KEYWORD_EXISTS_ELSEWHERE) when a keyword with the same name -- in any capitals -- already exists elsewhere
+-- in the tree, because every by-name lookup then hits whichever comes first; allowDuplicateName overrides.
+-- Idempotent: the same name already directly inside the requested place returns that keyword, created=false, no
+-- write. Reads back where the new keyword actually sits; a requested parent it did not land in is PLACEMENT_MISMATCH
+-- (the keyword exists, in the wrong place -- fix it in the Keyword List). Optional catalogPath: refuse unless that
+-- catalog is open. includeOnExport defaults to true, LrC's own default. Names may not contain ',' or '|'.
+-- Response: keyword, id, created, parentId, parentName (both nil = top level), includeOnExport (READ from the
+-- keyword, not echoed -- nil if unreadable), includeOnExportRequested, placement ('as_requested' when a parent was
+-- given, 'unrequested' otherwise -- then check parentName), duplicatesElsewhere (same name, any capitals, elsewhere:
+-- only possible on created=false, or with allowDuplicateName). Reviewed independently 2026-10-06; findings folded.
+function CatalogModule.createKeyword(params, callback)
+    ensureLrModules()
+    params = params or {}
+    local keyword = params.keyword
+    if keyword == nil then
+        callback(ErrorUtils.createError("MISSING_PARAM", "Keyword is required"))
+        return
+    end
+    if type(keyword) ~= "string" or keyword:match("^%s*$") or keyword:find("[\r\n\t]")
+        or keyword:find("^%s") or keyword:find("%s$") or keyword:find("[,|]") then
+        callback(ErrorUtils.createError("INVALID_PARAM_VALUE",
+            "keyword must be non-blank, without leading/trailing spaces, tabs, line breaks, ',' or '|' "
+            .. "(Lightroom's own keyword separators)"))
+        return
+    end
+    if params.parentId ~= nil and params.parent ~= nil then
+        callback(ErrorUtils.createError("INVALID_PARAM", "Give parentId or parent, not both"))
+        return
+    end
+    local parentId = nil
+    if params.parentId ~= nil then
+        parentId = tonumber(params.parentId)
+        if not parentId then
+            callback(ErrorUtils.createError("INVALID_PARAM", "parentId must be a number"))
+            return
+        end
+    end
+    local parentName = params.parent
+    if parentName ~= nil and (type(parentName) ~= "string" or parentName == "") then
+        callback(ErrorUtils.createError("INVALID_PARAM_VALUE", "parent must be a non-empty keyword name"))
+        return
+    end
+    local wantParent = parentId ~= nil or parentName ~= nil
+    local includeOnExport = params.includeOnExport ~= false
+    local catalog = LrApplication.activeCatalog()
+    if params.catalogPath ~= nil then
+        local okPath, open = ErrorUtils.safeCall(function() return catalog:getPath() end)
+        if not okPath or not CatalogModule._samePath(open, params.catalogPath) then
+            callback(ErrorUtils.createError("WRONG_CATALOG", "Open catalog is '" .. tostring(open)
+                .. "', expected '" .. tostring(params.catalogPath) .. "' -- nothing changed"))
+            return
+        end
+    end
+    local opResult, opError = nil, nil
+    local idOf = function(k) return k and k.localIdentifier end
+    -- The keyword's REAL Include-on-Export, read from Lightroom (call inside a read txn); nil when unreadable.
+    -- LrKeyword:getAttributes().includeOnExport -- verified live 2026-10-06 (read back true; catalog column = 1).
+    -- ErrorUtils.safeCall (LrTasks.pcall), not plain pcall: an SDK call that yields cannot run under plain pcall --
+    -- live 2026-10-06, plain pcall read back nothing while the catalog said includeOnExport = 1.
+    local function exportFlag(kw)
+        if not (kw and kw.getAttributes) then return nil end
+        local okA, attrs = ErrorUtils.safeCall(function() return kw:getAttributes() end)
+        if okA and type(attrs) == "table" then return attrs.includeOnExport end
+        return nil
+    end
+    local function describe(m)
+        local _, pname = CatalogModule._placeOf(m.parent)
+        return "'" .. tostring(m.kw:getName()) .. "' (id " .. tostring(idOf(m.kw)) .. ") under "
+            .. (pname and ("'" .. pname .. "'") or "the top level")
+    end
+    local function exportNote(actual)
+        if actual == nil or actual == includeOnExport then return "" end
+        return "; its Include on Export is " .. tostring(actual) .. ", not the requested " .. tostring(includeOnExport)
+            .. " -- change it in the Keyword List"
+    end
+    local ok, err = ErrorUtils.safeCall(function()
+        -- 1. Resolve the parent and every keyword already holding the name, with its real export flag (read txn).
+        local parentKw, parentHits, parentNear, matches
+        catalog:withReadAccessDo(function()
+            local all = catalog:getKeywords()
+            if parentId then
+                parentKw = CatalogModule._findKeywordById(all, parentId)
+            elseif parentName then
+                parentHits, parentNear = {}, {}
+                for _, m in ipairs(CatalogModule._findKeywordsNamedCI(all, parentName)) do
+                    table.insert(m.kw:getName() == parentName and parentHits or parentNear, m)
+                end
+                if #parentHits == 1 then parentKw = parentHits[1].kw end
+            end
+            matches = CatalogModule._findKeywordsNamedCI(all, keyword)
+            for _, m in ipairs(matches) do m.inc = exportFlag(m.kw) end
+        end)
+        if wantParent and not parentKw then
+            if parentHits and #parentHits > 1 then
+                local ids = {}
+                for _, m in ipairs(parentHits) do table.insert(ids, tostring(idOf(m.kw))) end
+                opError = { code = "PARENT_AMBIGUOUS", message = "Parent '" .. parentName .. "' names "
+                    .. #parentHits .. " keywords (ids " .. table.concat(ids, ", ") .. ") -- use parentId" }
+            elseif parentNear and #parentNear > 0 then
+                local near = {}
+                for _, m in ipairs(parentNear) do table.insert(near, describe(m)) end
+                opError = { code = "PARENT_NOT_FOUND", message = "No keyword is named exactly '" .. parentName
+                    .. "'; in other capitals: " .. table.concat(near, "; ") .. " -- use that exact name or its id" }
+            else
+                opError = { code = "PARENT_NOT_FOUND", message = "Parent keyword "
+                    .. (parentId and ("id " .. tostring(parentId)) or ("'" .. tostring(parentName) .. "'"))
+                    .. " not found -- create it first (a top-level keyword needs Lightroom's own Keyword List)" }
+            end
+            return
+        end
+        -- 2. Already exactly where it was asked for? Return it, no write -- and say so if same-named keywords also
+        --    exist elsewhere, since every by-name lookup is then ambiguous.
+        for _, m in ipairs(matches) do
+            if m.kw:getName() == keyword and idOf(m.parent) == idOf(parentKw) then
+                local pid, pname = CatalogModule._placeOf(m.parent)
+                local others = {}
+                for _, o in ipairs(matches) do
+                    if idOf(o.kw) ~= idOf(m.kw) then
+                        local oid, oname = CatalogModule._placeOf(o.parent)
+                        table.insert(others, { id = idOf(o.kw), name = o.kw:getName(), parentId = oid, parentName = oname })
+                    end
+                end
+                local msg = "Keyword already exists there"
+                if #others > 0 then
+                    local d = {}
+                    for _, o in ipairs(matches) do if idOf(o.kw) ~= idOf(m.kw) then table.insert(d, describe(o)) end end
+                    msg = msg .. "; WARNING: same name also at " .. table.concat(d, "; ")
+                        .. " -- by-name lookups (batch-set --keyword) will hit whichever comes first"
+                end
+                opResult = { keyword = keyword, id = idOf(m.kw), created = false, parentId = pid, parentName = pname,
+                    includeOnExport = m.inc, includeOnExportRequested = includeOnExport,
+                    placement = wantParent and "as_requested" or "unrequested", duplicatesElsewhere = others,
+                    message = msg .. exportNote(m.inc) }
+                return
+            end
+        end
+        if #matches > 0 and params.allowDuplicateName ~= true then
+            local where = {}
+            for _, m in ipairs(matches) do table.insert(where, describe(m)) end
+            opError = { code = "KEYWORD_EXISTS_ELSEWHERE", message = "A keyword with this name already exists: "
+                .. table.concat(where, "; ") .. " -- move or rename that one, or pass allowDuplicateName" }
+            return
+        end
+        -- 3. Create (write txn). `written` is set INSIDE the closure, so a write that never runs can't report success.
+        local before = {}
+        for _, m in ipairs(matches) do before[idOf(m.kw)] = true end
+        local written = false
+        local status = catalog:withWriteAccessDo("Create Keyword", function()
+            catalog:createKeyword(keyword, {}, includeOnExport, parentKw, true)
+            written = true
+        end, { timeout = 10 })
+        if not written then
+            if status == "queued" then
+                opError = { code = "OPERATION_FAILED", message = "Lightroom queued the write instead of running it -- "
+                    .. "the keyword may still be created; re-run this command (it is idempotent) to see" }
+            else
+                opError = { code = "OPERATION_FAILED", message = "The write did not run (catalog busy?) -- nothing created" }
+            end
+            return
+        end
+        -- 4. Read back where it actually landed, and its real export flag (read txn).
+        local made
+        catalog:withReadAccessDo(function()
+            for _, m in ipairs(CatalogModule._findKeywordsNamedCI(catalog:getKeywords(), keyword)) do
+                if m.kw:getName() == keyword and not before[idOf(m.kw)] then
+                    made = m
+                    made.inc = exportFlag(m.kw)
+                end
+            end
+        end)
+        if not made then
+            opError = { code = "OPERATION_FAILED", message = "The write ran but no new keyword was found on read-back"
+                .. (#matches > 0 and " (Lightroom may have handed back the existing same-named keyword instead)" or "") }
+            return
+        end
+        local pid, pname = CatalogModule._placeOf(made.parent)
+        if wantParent and pid ~= idOf(parentKw) then
+            opError = { code = "PLACEMENT_MISMATCH", message = "Created '" .. keyword .. "' (id " .. tostring(idOf(made.kw))
+                .. ") under " .. (pname and ("'" .. pname .. "'") or "the top level") .. ", not under '"
+                .. tostring(parentKw:getName()) .. "' -- move it in the Keyword List" }
+            return
+        end
+        opResult = { keyword = keyword, id = idOf(made.kw), created = true, parentId = pid, parentName = pname,
+            includeOnExport = made.inc, includeOnExportRequested = includeOnExport,
+            placement = wantParent and "as_requested" or "unrequested", duplicatesElsewhere = {},
+            message = "Keyword created" .. exportNote(made.inc) }
+    end)
+    if not ok then
+        callback(ErrorUtils.createError("OPERATION_FAILED", tostring(err)))
+    elseif opError then
+        callback(ErrorUtils.createError(opError.code, opError.message))
+    else
+        callback(ErrorUtils.createSuccess(opResult))
+    end
+end
+
+-- Pure: the keyword whose localIdentifier is `id`, and the parent the walk found it under (nil = top level).
+-- Unit-testable.
+function CatalogModule._findKeywordWithParent(keywords, id, parent)
+    if type(keywords) ~= "table" or id == nil then return nil end
+    for _, kw in ipairs(keywords) do
+        if kw.localIdentifier == id then return kw, parent end
+        if kw.getChildren then
+            local found, p = CatalogModule._findKeywordWithParent(kw:getChildren(), id, kw)
+            if found then return found, p end
+        end
+    end
+    return nil
+end
+
+-- Pure: the set of localIdentifiers in a list of SDK objects, and its size. Unit-testable.
+function CatalogModule._idSet(list)
+    local s, n = {}, 0
+    for _, x in ipairs(list or {}) do
+        local id = x.localIdentifier
+        if id ~= nil and not s[id] then
+            s[id] = true
+            n = n + 1
+        end
+    end
+    return s, n
+end
+
+-- Pure: do two id sets hold exactly the same ids? Unit-testable.
+function CatalogModule._sameIdSet(a, na, b, nb)
+    if na ~= nb then return false end
+    for k in pairs(a) do if not b[k] then return false end end
+    return true
+end
+
+-- catalog.moveKeyword -- move an existing keyword INSIDE another keyword, or to the top level (2026-10-07).
+-- Uses LrKeyword:setParent, which `catalog probe-api` found on LrC 15 (2026-10-07) although Adobe documents no way to
+-- move a keyword and the April 2026 note said there was none. So nothing about it is trusted: the keyword is
+-- re-found BY ID after the write, and the move counts only if it is the same keyword (same id), directly inside the
+-- requested parent, with the SAME photos and child keywords (compared as id sets -- review 2026-10-07: counts
+-- alone would pass a swap), and no second keyword of its name appeared.
+-- Target: parentId, parent (an exact name naming exactly one keyword), or toTop. Refuses: the keyword itself or one
+-- of its own descendants as the target (INVALID_MOVE); a keyword of the same name, any capitals, already directly
+-- in the target (NAME_EXISTS_IN_TARGET -- LrC keeps names unique per parent). Already there: moved=false, no write.
+-- Optional catalogPath: refuse unless that catalog is open (keyword ids are per catalog).
+-- Response: id, keyword, moved, fromParentId, fromParentName, parentId, parentName (both nil = top level),
+-- photoCount, childCount, writeStatus.
+function CatalogModule.moveKeyword(params, callback)
+    ensureLrModules()
+    params = params or {}
+    local keywordId = tonumber(params.keywordId)
+    if not keywordId then
+        callback(ErrorUtils.createError("MISSING_PARAM", "keywordId (a number) is required"))
+        return
+    end
+    local toTop = params.toTop == true
+    local given = (params.parentId ~= nil and 1 or 0) + (params.parent ~= nil and 1 or 0) + (toTop and 1 or 0)
+    if given ~= 1 then
+        callback(ErrorUtils.createError("INVALID_PARAM", "Give exactly one of parentId, parent or toTop"))
+        return
+    end
+    local parentId = nil
+    if params.parentId ~= nil then
+        parentId = tonumber(params.parentId)
+        if not parentId then
+            callback(ErrorUtils.createError("INVALID_PARAM", "parentId must be a number"))
+            return
+        end
+    end
+    local parentName = params.parent
+    if parentName ~= nil and (type(parentName) ~= "string" or parentName == "") then
+        callback(ErrorUtils.createError("INVALID_PARAM_VALUE", "parent must be a non-empty keyword name"))
+        return
+    end
+    local catalog = LrApplication.activeCatalog()
+    if params.catalogPath ~= nil then
+        local okPath, open = ErrorUtils.safeCall(function() return catalog:getPath() end)
+        if not okPath or not CatalogModule._samePath(open, params.catalogPath) then
+            callback(ErrorUtils.createError("WRONG_CATALOG", "Open catalog is '" .. tostring(open)
+                .. "', expected '" .. tostring(params.catalogPath) .. "' -- nothing changed"))
+            return
+        end
+    end
+    local opResult, opError = nil, nil
+    local idOf = function(k) return k and k.localIdentifier end
+    local function where(pid, pname)
+        if pid == nil then return "the top level" end
+        return "'" .. tostring(pname) .. "' (id " .. tostring(pid) .. ")"
+    end
+    local ok, err = ErrorUtils.safeCall(function()
+        -- 1. The keyword, where it is now, and the target (read txn).
+        -- Names are read here, inside the transaction; later steps use only ids and these strings.
+        local kw, fromParent, target, targetName, hits, near, name, sameBefore, cycle
+        local photosBefore, nPhotosBefore, kidsBefore, nKidsBefore
+        local fromId, fromName
+        local inTarget = {}
+        catalog:withReadAccessDo(function()
+            local all = catalog:getKeywords()
+            kw, fromParent = CatalogModule._findKeywordWithParent(all, keywordId)
+            if not kw then return end
+            name = kw:getName()
+            fromId, fromName = CatalogModule._placeOf(fromParent)
+            if parentId then
+                target = CatalogModule._findKeywordById(all, parentId)
+            elseif parentName then
+                hits, near = {}, {}
+                for _, m in ipairs(CatalogModule._findKeywordsNamedCI(all, parentName)) do
+                    local mname = m.kw:getName()
+                    table.insert(mname == parentName and hits or near, { id = idOf(m.kw), name = mname, kw = m.kw })
+                end
+                if #hits == 1 then target = hits[1].kw end
+            end
+            if target then
+                targetName = target:getName()
+                cycle = idOf(target) == keywordId
+                    or CatalogModule._findKeywordById(kw:getChildren(), idOf(target)) ~= nil
+            end
+            local siblings = toTop and all or (target and target:getChildren()) or {}
+            for _, s in ipairs(siblings) do
+                local sname = s:getName()
+                if idOf(s) ~= keywordId and type(sname) == "string" and sname:lower() == name:lower() then
+                    table.insert(inTarget, { id = idOf(s), name = sname })
+                end
+            end
+            photosBefore, nPhotosBefore = CatalogModule._idSet(kw:getPhotos())
+            kidsBefore, nKidsBefore = CatalogModule._idSet(kw:getChildren())
+            sameBefore = #CatalogModule._findKeywordsNamedCI(all, name)
+        end)
+        if not kw then
+            opError = { code = "KEYWORD_NOT_FOUND",
+                message = "No keyword with id " .. keywordId .. " -- nothing changed" }
+            return
+        end
+        if not toTop and not target then
+            if hits and #hits > 1 then
+                local ids = {}
+                for _, m in ipairs(hits) do table.insert(ids, tostring(m.id)) end
+                opError = { code = "PARENT_AMBIGUOUS", message = "Parent '" .. parentName .. "' names " .. #hits
+                    .. " keywords (ids " .. table.concat(ids, ", ") .. ") -- use parentId" }
+            elseif near and #near > 0 then
+                local d = {}
+                for _, m in ipairs(near) do
+                    table.insert(d, "'" .. tostring(m.name) .. "' (id " .. tostring(m.id) .. ")")
+                end
+                opError = { code = "PARENT_NOT_FOUND", message = "No keyword is named exactly '" .. parentName
+                    .. "'; in other capitals: " .. table.concat(d, "; ") .. " -- use that exact name or its id" }
+            else
+                opError = { code = "PARENT_NOT_FOUND", message = "Parent keyword "
+                    .. (parentId and ("id " .. tostring(parentId)) or ("'" .. tostring(parentName) .. "'"))
+                    .. " not found -- nothing changed" }
+            end
+            return
+        end
+        if cycle then
+            opError = { code = "INVALID_MOVE", message = "Cannot move '" .. name .. "' into itself or into one of "
+                .. "its own descendants -- nothing changed" }
+            return
+        end
+        local wantId = (not toTop) and idOf(target) or nil
+        local wantName = (not toTop) and targetName or nil
+        if fromId == wantId then
+            opResult = { id = keywordId, keyword = name, moved = false, fromParentId = fromId,
+                fromParentName = fromName, parentId = fromId, parentName = fromName, photoCount = nPhotosBefore,
+                childCount = nKidsBefore,
+                message = "Already under " .. where(fromId, fromName) .. " -- nothing changed" }
+            return
+        end
+        if #inTarget > 0 then
+            local d = {}
+            for _, s in ipairs(inTarget) do
+                table.insert(d, "'" .. tostring(s.name) .. "' (id " .. tostring(s.id) .. ")")
+            end
+            opError = { code = "NAME_EXISTS_IN_TARGET", message = where(wantId, wantName) .. " already holds "
+                .. table.concat(d, "; ") .. " -- rename or merge first; nothing changed" }
+            return
+        end
+        -- 2. Move (write txn). Both are re-found by id inside the transaction; `entered` is set inside the closure,
+        --    so a write that never ran cannot read as one that did. A failing setParent is caught so step 3 runs.
+        local entered, status, vanished = false, nil, false
+        local callOk, callErr = ErrorUtils.safeCall(function()
+            status = catalog:withWriteAccessDo("Move Keyword", function()
+                entered = true
+                local all = catalog:getKeywords()
+                local k = CatalogModule._findKeywordById(all, keywordId)
+                local t = nil
+                if not toTop then t = CatalogModule._findKeywordById(all, wantId) end
+                if not k or (not toTop and not t) then
+                    vanished = true
+                    error("the keyword or its target vanished before the move")
+                end
+                k:setParent(t)
+            end, { timeout = 10 })
+        end)
+        -- 3. Read back BY ID: is it the same keyword, where is it, are its photos and children intact, and did a
+        --    second keyword of its name appear?
+        local after, afterParent, photosAfter, nPhotosAfter, kidsAfter, nKidsAfter, sameAfter, nowId, nowName
+        catalog:withReadAccessDo(function()
+            local all = catalog:getKeywords()
+            after, afterParent = CatalogModule._findKeywordWithParent(all, keywordId)
+            if after then
+                photosAfter, nPhotosAfter = CatalogModule._idSet(after:getPhotos())
+                kidsAfter, nKidsAfter = CatalogModule._idSet(after:getChildren())
+                nowId, nowName = CatalogModule._placeOf(afterParent)
+            end
+            sameAfter = #CatalogModule._findKeywordsNamedCI(all, name)
+        end)
+        local nowWhere = after and where(nowId, nowName) or "nowhere: id " .. keywordId .. " is no longer in the tree"
+        if not callOk or not entered then
+            local why
+            if vanished then
+                why = "The keyword or its target vanished before setParent was called"
+            elseif not callOk then
+                why = "setParent failed: " .. tostring(callErr)
+            elseif status == "queued" then
+                why = "Lightroom queued the write instead of running it -- it may still happen; re-run to see"
+            else
+                why = "The write did not run (catalog busy?)"
+            end
+            opError = { code = "OPERATION_FAILED",
+                message = why .. ". Read back: '" .. name .. "' is under " .. nowWhere }
+            return
+        end
+        if not after then
+            opError = { code = "KEYWORD_LOST", message = "After setParent, keyword id " .. keywordId .. " ('" .. name
+                .. "') is no longer in the tree; keywords named '" .. name .. "' now: " .. tostring(sameAfter)
+                .. " (before: " .. tostring(sameBefore) .. ") -- check the Keyword List" }
+            return
+        end
+        local copies = sameAfter ~= sameBefore and ("; keywords named '" .. name .. "': " .. tostring(sameBefore)
+            .. " -> " .. tostring(sameAfter) .. " (a copy may have been made)") or ""
+        if nowId ~= wantId then
+            opError = { code = "PLACEMENT_MISMATCH", message = "'" .. name .. "' is under " .. nowWhere .. ", not "
+                .. where(wantId, wantName) .. " (it was under " .. where(fromId, fromName) .. ")" .. copies }
+            return
+        end
+        local samePhotos = CatalogModule._sameIdSet(photosBefore, nPhotosBefore, photosAfter, nPhotosAfter)
+        local sameKids = CatalogModule._sameIdSet(kidsBefore, nKidsBefore, kidsAfter, nKidsAfter)
+        if not samePhotos or not sameKids or sameAfter ~= sameBefore then
+            opError = { code = "MOVE_CHANGED_KEYWORD", message = "'" .. name .. "' moved to " .. nowWhere
+                .. " but changed: photos " .. tostring(nPhotosBefore) .. " -> " .. tostring(nPhotosAfter)
+                .. (samePhotos and "" or " (not the same photos)")
+                .. ", child keywords " .. tostring(nKidsBefore) .. " -> " .. tostring(nKidsAfter)
+                .. (sameKids and "" or " (not the same children)")
+                .. ", keywords with this name " .. tostring(sameBefore) .. " -> " .. tostring(sameAfter) }
+            return
+        end
+        opResult = { id = keywordId, keyword = name, moved = true, fromParentId = fromId, fromParentName = fromName,
+            parentId = nowId, parentName = nowName, photoCount = nPhotosAfter, childCount = nKidsAfter,
+            writeStatus = status, message = "Moved from " .. where(fromId, fromName) .. " to " .. nowWhere }
+    end)
+    if not ok then
+        callback(ErrorUtils.createError("OPERATION_FAILED", tostring(err)))
+    elseif opError then
+        callback(ErrorUtils.createError(opError.code, opError.message))
+    else
+        callback(ErrorUtils.createSuccess(opResult))
     end
 end
 
@@ -1687,9 +2784,14 @@ function CatalogModule.removeKeyword(params, callback)
     local opError = nil
     local writeSuccess, writeErr = ErrorUtils.safeCall(function()
         catalog:withWriteAccessDo("Remove Keyword", function()
-            local photo = catalog:getPhotoByLocalId(tonumber(photoId))
+            local photo, lookupErr = CatalogModule._photoById(catalog, photoId)
+            if lookupErr then
+                opError = { code = "OPERATION_FAILED", message = "Could not look up photo " .. tostring(photoId)
+                    .. ": " .. lookupErr }
+                return
+            end
             if not photo then
-                opError = { code = "PHOTO_NOT_FOUND", message = "Photo not found" }
+                opError = { code = "PHOTO_NOT_FOUND", message = "Photo " .. tostring(photoId) .. " not found" }
                 return
             end
             -- Find keyword object by name
@@ -1721,6 +2823,1013 @@ function CatalogModule.removeKeyword(params, callback)
     end
 end
 
+-- Look a photo up by id and tell "not in the catalog" from "lookup failed". Measured live 2026-10-07 with the
+-- read-only `catalog probe-photo` diagnostic (Carolyn's catalog, id 0 vs a real photo): for an id that is NOT in the
+-- catalog, getPhotoByLocalId does not throw and does not return nil -- it returns a DUD object whose localIdentifier
+-- echoes the id and whose getRawMetadata('uuid') and ('path') return nil without error, while 'pickStatus',
+-- 'keywords' and getFormattedMetadata throw "?:0: attempt to index a nil value". Every real photo has a uuid. So: no
+-- uuid = not there. Returns photo, nil when found; nil, nil when not there (or a non-numeric id); nil, err when the
+-- lookup or the uuid read itself fails -- callers must read that as unverified, never as "not there".
+-- (Two earlier fixes guessed wrong about where the failure happens; see CHANGELOG 2026-10-07.)
+function CatalogModule._photoById(catalog, id)
+    local n = tonumber(id)
+    if not n then return nil, nil end
+    local ok, photo, uuid = ErrorUtils.safeCall(function()
+        local p = catalog:getPhotoByLocalId(n)
+        if p == nil then return nil, nil end
+        return p, p:getRawMetadata("uuid")
+    end)
+    if not ok then return nil, tostring(photo) end
+    if photo == nil or uuid == nil then return nil, nil end
+    return photo, nil
+end
+
+-- catalog.probePhoto -- DIAGNOSTIC, read-only (2026-10-07). For one photo id, run each step a command takes when it
+-- looks a photo up and reads it, each in its own protected call, and report which step fails and how. Built because
+-- an unknown id fails with "?:0: attempt to index a nil value" and two fixes guessed wrong about WHERE (live
+-- 2026-10-06/07): wrapping the lookup, then the lookup plus a uuid read, did not catch it. Never opens a write.
+-- Response: photoId, steps[{step, ok, result, error}].
+function CatalogModule.probePhoto(params, callback)
+    ensureLrModules()
+    local n = tonumber(params and params.photoId)
+    if not n then
+        callback(ErrorUtils.createError("MISSING_PARAM", "photoId (a number) is required"))
+        return
+    end
+    local catalog = LrApplication.activeCatalog()
+    local steps = {}
+    local function describe(v)
+        local t = type(v)
+        if t == "table" then
+            local c = 0
+            for _ in pairs(v) do c = c + 1 end
+            return "table with " .. c .. " entries"
+        end
+        if t == "string" then return "string: " .. v:sub(1, 120) end
+        if v == nil then return "nil" end
+        return t .. ": " .. tostring(v)
+    end
+    local function step(name, fn, plain)
+        local ok, v
+        if plain then ok, v = pcall(fn) else ok, v = LrTasks.pcall(fn) end
+        table.insert(steps, { step = name, ok = ok, result = ok and describe(v) or nil,
+                              error = (not ok) and tostring(v) or nil })
+        return ok, v
+    end
+    step("lookup, no read txn, LrTasks.pcall", function() return catalog:getPhotoByLocalId(n) end)
+    local okTxn, txnErr = LrTasks.pcall(function()
+        catalog:withReadAccessDo(function()
+            step("lookup, read txn, plain pcall", function() return catalog:getPhotoByLocalId(n) end, true)
+            local ok, photo = step("lookup, read txn, LrTasks.pcall", function() return catalog:getPhotoByLocalId(n) end)
+            if ok and photo ~= nil then
+                step("photo.localIdentifier", function() return photo.localIdentifier end)
+                for _, key in ipairs({ "uuid", "path", "pickStatus", "keywords" }) do
+                    step("getRawMetadata('" .. key .. "')", function() return photo:getRawMetadata(key) end)
+                end
+                step("getFormattedMetadata('fileName')", function() return photo:getFormattedMetadata("fileName") end)
+            end
+        end)
+    end)
+    if not okTxn then table.insert(steps, { step = "the read transaction itself", ok = false, error = tostring(txnErr) }) end
+    callback(ErrorUtils.createSuccess({ photoId = n, steps = steps }))
+end
+
+-- Names looked up (never called) by probeApi: anything that could delete, remove or move a keyword.
+CatalogModule.PROBE_API_CANDIDATES = { "deleteKeyword", "deleteKeywords", "deleteKeywordAndChildren",
+    "removeKeyword", "removeKeywords", "removeKeywordFromCatalog", "removeChild", "removeChildren", "purge",
+    "purgeKeyword", "purgeKeywords", "purgeUnusedKeywords", "erase", "eraseKeyword", "delete", "remove", "destroy",
+    "dispose", "unlink", "detach", "setParent", "setParentKeyword", "reparent", "move", "moveKeyword", "moveTo" }
+
+-- Documented SDK methods that a complete listing MUST contain: the proof the walk sees the real class.
+CatalogModule.PROBE_API_KNOWN = {
+    catalog = { "createKeyword", "getKeywords", "withReadAccessDo", "withWriteAccessDo" },
+    keyword = { "getName", "getChildren", "getAttributes" },
+}
+
+-- Pure: which methods does `obj` expose? Walks the object, its metatable's __index table and THAT table's chain
+-- (how SDK classes inherit), collecting every string key whose value is a function or a callable table (skipping
+-- `__` metamethods), then looks up each candidate name directly (which also reaches a computed __index). It reads
+-- keys; it never calls a function it finds. Anything the walk could NOT see is named in `blind` (a computed
+-- __index or a hidden metatable at any depth, or the depth cap), and `knownMissing` lists documented methods absent
+-- from the listing. `listingComplete` is true only when both are empty -- only then can an absent name be read as
+-- "not there"; otherwise only the candidates are conclusive, each for itself (anything but "nil" is a hit).
+-- Review 2026-10-07: without `blind`, a computed __index one level down read as a clean, complete listing.
+-- Unit-testable.
+local PROBE_MAX_DEPTH = 8
+function CatalogModule._probeObject(label, obj, candidates, lookup, known)
+    lookup = lookup or pcall
+    local out = { object = label, luaType = type(obj), methods = {}, candidates = {}, errors = {}, blind = {},
+                  knownMissing = {}, suspicious = {} }
+    local names, seen = {}, {}
+    local function callable(v)
+        if type(v) == "function" then return true end
+        if type(v) ~= "table" then return false end
+        local ok, mt = pcall(getmetatable, v)
+        return ok and type(mt) == "table" and rawget(mt, "__call") ~= nil
+    end
+    local function walk(t, depth)
+        if t == nil or seen[t] then return end
+        if depth > PROBE_MAX_DEPTH then
+            table.insert(out.blind, "depth cap " .. PROBE_MAX_DEPTH .. " reached")
+            return
+        end
+        seen[t] = true
+        if type(t) == "table" then
+            local ok, err = pcall(function()
+                for k, v in pairs(t) do
+                    if type(k) == "string" and k:sub(1, 2) ~= "__" and callable(v) then names[k] = true end
+                end
+            end)
+            if not ok then table.insert(out.errors, "listing at depth " .. depth .. ": " .. tostring(err)) end
+        end
+        local okMt, mt = pcall(getmetatable, t)
+        if not okMt then
+            table.insert(out.blind, "getmetatable failed at depth " .. depth .. ": " .. tostring(mt))
+            if depth == 0 then out.indexKind = "getmetatable failed" end
+        elseif type(mt) == "table" then
+            local idx = rawget(mt, "__index")
+            if depth == 0 then out.indexKind = type(idx) end
+            if type(idx) == "table" then
+                walk(idx, depth + 1)
+            elseif idx ~= nil then
+                table.insert(out.blind, "computed __index (" .. type(idx) .. ") at depth " .. depth)
+            end
+        elseif mt ~= nil then
+            table.insert(out.blind, "hidden metatable (" .. type(mt) .. ") at depth " .. depth)
+            if depth == 0 then out.indexKind = "hidden metatable (" .. type(mt) .. ")" end
+        elseif depth == 0 then
+            out.indexKind = "none"
+        end
+    end
+    walk(obj, 0)
+    for k in pairs(names) do table.insert(out.methods, k) end
+    table.sort(out.methods)
+    for _, k in ipairs(out.methods) do
+        local l = k:lower()
+        for _, word in ipairs({ "delete", "remove", "purge", "erase", "move", "parent", "destroy" }) do
+            if l:find(word, 1, true) then table.insert(out.suspicious, k) break end
+        end
+    end
+    for _, k in ipairs(known or {}) do
+        if not names[k] then table.insert(out.knownMissing, k) end
+    end
+    out.listingComplete = #out.blind == 0 and #out.errors == 0 and #out.knownMissing == 0 and known ~= nil
+    for _, name in ipairs(candidates or {}) do
+        local ok, v = lookup(function() return obj[name] end)
+        out.candidates[name] = ok and type(v) or ("lookup error: " .. tostring(v))
+    end
+    return out
+end
+
+-- catalog.probeApi -- DIAGNOSTIC, read-only (2026-10-07). Which methods does Lightroom expose on the catalog and on a
+-- keyword? Built to settle whether the SDK can delete a keyword (Ken asked for `delete-keyword`): Adobe documents no
+-- such call, and the retired lightroom_mcp's `catalog:deleteKeyword` batch only ever logged "deleted=0". It looks
+-- names up and walks metatables; it never calls anything it finds, and never opens a write.
+-- Response: keywordId, keywordName, objects[{object, luaType, indexKind, methods[], candidates{name=type}, errors[],
+-- blind[], knownMissing[], suspicious[], listingComplete}]. Read "no delete" only from listingComplete objects.
+function CatalogModule.probeApi(params, callback)
+    ensureLrModules()
+    local raw = params and params.keywordId
+    local wantId = raw ~= nil and tonumber(raw) or nil
+    if raw ~= nil and not wantId then
+        callback(ErrorUtils.createError("INVALID_PARAM", "keywordId must be a number"))
+        return
+    end
+    local catalog = LrApplication.activeCatalog()
+    local objects, kwId, kwName = {}, nil, nil
+    local ok, err = LrTasks.pcall(function()
+        catalog:withReadAccessDo(function()
+            table.insert(objects, CatalogModule._probeObject("catalog", catalog, CatalogModule.PROBE_API_CANDIDATES,
+                LrTasks.pcall, CatalogModule.PROBE_API_KNOWN.catalog))
+            local kw
+            if wantId then
+                kw = CatalogModule._keywordsInTreeById(catalog:getKeywords(), { [wantId] = true })[wantId]
+            else
+                kw = catalog:getKeywords()[1]
+            end
+            if kw then
+                kwId = kw.localIdentifier
+                local okName, name = LrTasks.pcall(function() return kw:getName() end)
+                kwName = okName and name or nil
+                table.insert(objects, CatalogModule._probeObject("keyword", kw, CatalogModule.PROBE_API_CANDIDATES,
+                    LrTasks.pcall, CatalogModule.PROBE_API_KNOWN.keyword))
+            end
+        end)
+    end)
+    if not ok then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Probe failed: " .. tostring(err)))
+        return
+    end
+    if wantId and not kwId then
+        callback(ErrorUtils.createError("KEYWORD_NOT_FOUND", "Keyword " .. wantId .. " not found"))
+        return
+    end
+    callback(ErrorUtils.createSuccess({ keywordId = kwId, keywordName = kwName, objects = objects }))
+end
+
+-- Pure: validate {photoId, keywordId} pairs and group them by photo, in first-seen order, dropping duplicate pairs.
+-- Returns groups ({ {photoId=, keywordIds={...}}, ... }) and the distinct pair count, or nil, count|nil, message.
+-- Unit-testable.
+function CatalogModule._groupKeywordPairs(list, maxPairs)
+    if type(list) ~= "table" or #list == 0 then
+        return nil, nil, "pairs array is required"
+    end
+    local groups, byPhoto, n = {}, {}, 0
+    for i, p in ipairs(list) do
+        local pid = type(p) == "table" and tonumber(p.photoId) or nil
+        local kid = type(p) == "table" and tonumber(p.keywordId) or nil
+        if not pid or not kid then
+            return nil, nil, "pair " .. i .. " needs a numeric photoId and keywordId"
+        end
+        local g = byPhoto[pid]
+        if not g then
+            g = { photoId = pid, keywordIds = {}, seen = {} }
+            byPhoto[pid] = g
+            table.insert(groups, g)
+        end
+        if not g.seen[kid] then
+            g.seen[kid] = true
+            table.insert(g.keywordIds, kid)
+            n = n + 1
+        end
+    end
+    if maxPairs and n > maxPairs then
+        return nil, n, "Maximum batch size is " .. maxPairs .. " pairs"
+    end
+    return groups, n
+end
+
+-- Pure: of a photo's keyword objects, the ones whose localIdentifier is wanted, as a map id -> keyword.
+-- Unit-testable.
+function CatalogModule._keywordsById(keywords, wantIds)
+    local want, found = {}, {}
+    for _, id in ipairs(wantIds or {}) do want[id] = true end
+    if type(keywords) == "table" then
+        for _, kw in ipairs(keywords) do
+            if kw.localIdentifier ~= nil and want[kw.localIdentifier] then
+                found[kw.localIdentifier] = kw
+            end
+        end
+    end
+    return found
+end
+
+-- Remove keywords (by localIdentifier) from photos: up to 200 {photoId, keywordId} pairs per call, in ONE write
+-- transaction. Works from each photo's own keyword list, so it never walks the keyword tree (Carolyn's has 14k).
+-- Every pair's outcome comes from reads: what was on the photo BEFORE the write and what is there AFTER it, so a
+-- write that never ran (LrC returns without running the closure on a lock timeout) or a removal LrC ignored reports
+-- still_present -- never removed; a keyword list that cannot be read reports unverified. Each photo's keyword COUNT
+-- is compared too: if it changed by anything other than what was removed from it, the photo is listed in
+-- collateralPhotos. Optional catalogPath: refuse unless the open catalog is that file (photo ids are per-catalog).
+-- No write transaction when none of the pairs is on a photo. Catalog only: a file changes on Save Metadata, or by
+-- itself if the catalog auto-writes XMP. The keyword objects stay, possibly now on no photo; delete those separately.
+-- Response: requested, removed, notOnPhoto, photoNotFound, stillPresent, unverified, collateralPhotos, complete,
+-- writeRan, writeError, results[{photoId, keywordId, status}].
+-- complete == (stillPresent, unverified and photoNotFound all 0, and no collateralPhotos) -- photoNotFound since
+-- 2026-10-07, matching batchAddKeywords.
+-- Reviewed independently 2026-10-04 (session 2c16332c); its findings are folded in.
+
+-- Pure: do two catalog paths name the same file? Case-insensitive, slashes normalised (Windows). Unit-testable.
+function CatalogModule._samePath(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" then return false end
+    local function norm(p)
+        local s = p:gsub("\\", "/")
+        s = s:gsub("/+$", "")
+        return s:lower()
+    end
+    return norm(a) == norm(b)
+end
+
+function CatalogModule.batchRemoveKeywords(params, callback)
+    ensureLrModules()
+    local groups, n, perr = CatalogModule._groupKeywordPairs(params and params.pairs, 200)
+    if not groups then
+        local list = params and params.pairs
+        local code = "MISSING_PARAM"  -- absent, not a table, or empty
+        if n then
+            code = "BATCH_SIZE_EXCEEDED"
+        elseif type(list) == "table" and #list > 0 then
+            code = "INVALID_PARAM_VALUE"
+        end
+        callback(ErrorUtils.createError(code, perr))
+        return
+    end
+    local catalog = LrApplication.activeCatalog()
+    if params.catalogPath ~= nil then
+        local okPath, open = ErrorUtils.safeCall(function() return catalog:getPath() end)
+        if not okPath or not CatalogModule._samePath(open, params.catalogPath) then
+            callback(ErrorUtils.createError("WRONG_CATALOG", "Open catalog is '" .. tostring(open)
+                .. "', expected '" .. tostring(params.catalogPath) .. "' -- nothing changed"))
+            return
+        end
+    end
+
+    -- state[photoId] = { row = {keywordId -> bool}, count = n } | { unreadable = true } ; absent = photo not found
+    local function snapshot()
+        local state = {}
+        catalog:withReadAccessDo(function()
+            for _, g in ipairs(groups) do
+                local photo, lookupErr = CatalogModule._photoById(catalog, g.photoId)
+                if lookupErr then
+                    state[g.photoId] = { unreadable = true }   -- a failed lookup is not a missing photo
+                elseif photo then
+                    local kws = photo:getRawMetadata("keywords")
+                    if type(kws) ~= "table" then
+                        state[g.photoId] = { unreadable = true }
+                    else
+                        local found = CatalogModule._keywordsById(kws, g.keywordIds)
+                        local row = {}
+                        for _, kid in ipairs(g.keywordIds) do row[kid] = found[kid] ~= nil end
+                        state[g.photoId] = { row = row, count = #kws }
+                    end
+                end
+            end
+        end)
+        return state
+    end
+
+    local okBefore, before = ErrorUtils.safeCall(snapshot)
+    if not okBefore then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Could not read the photos' keywords: " .. tostring(before)))
+        return
+    end
+
+    local anyPresent = false
+    for _, g in ipairs(groups) do
+        local b = before[g.photoId]
+        if b and b.row then
+            for _, kid in ipairs(g.keywordIds) do
+                if b.row[kid] then anyPresent = true end
+            end
+        end
+    end
+
+    local writeRan, okWrite, writeErr = false, true, nil
+    if anyPresent then
+        okWrite, writeErr = ErrorUtils.safeCall(function()
+            catalog:withWriteAccessDo("Batch Remove Keywords", function()
+                writeRan = true
+                for _, g in ipairs(groups) do
+                    local b = before[g.photoId]
+                    if b and b.row then
+                        local photo = CatalogModule._photoById(catalog, g.photoId)   -- nil if it vanished
+                        local found = CatalogModule._keywordsById(photo and photo:getRawMetadata("keywords"), g.keywordIds)
+                        for _, kid in ipairs(g.keywordIds) do
+                            if b.row[kid] and found[kid] then photo:removeKeyword(found[kid]) end
+                        end
+                    end
+                end
+            end, { timeout = 60 })
+        end)
+    end
+
+    local okAfter, after = ErrorUtils.safeCall(snapshot)
+    local counts = { removed = 0, notOnPhoto = 0, photoNotFound = 0, stillPresent = 0, unverified = 0 }
+    local results, collateral = {}, {}
+    for _, g in ipairs(groups) do
+        local b = before[g.photoId]
+        local a = okAfter and after[g.photoId] or nil
+        local removedHere = 0
+        for _, kid in ipairs(g.keywordIds) do
+            local status
+            if not b then
+                status = "photo_not_found"; counts.photoNotFound = counts.photoNotFound + 1
+            elseif not b.row then
+                status = "unverified"; counts.unverified = counts.unverified + 1
+            elseif not b.row[kid] then
+                status = "not_on_photo"; counts.notOnPhoto = counts.notOnPhoto + 1
+            elseif not a or not a.row then
+                status = "unverified"; counts.unverified = counts.unverified + 1
+            elseif a.row[kid] then
+                status = "still_present"; counts.stillPresent = counts.stillPresent + 1
+            else
+                status = "removed"; counts.removed = counts.removed + 1; removedHere = removedHere + 1
+            end
+            table.insert(results, { photoId = g.photoId, keywordId = kid, status = status })
+        end
+        if b and b.row and a and a.row and a.count ~= b.count - removedHere then
+            table.insert(collateral, g.photoId)
+        end
+    end
+    callback(ErrorUtils.createSuccess({
+        requested = n,
+        removed = counts.removed,
+        notOnPhoto = counts.notOnPhoto,
+        photoNotFound = counts.photoNotFound,
+        stillPresent = counts.stillPresent,
+        unverified = counts.unverified,
+        collateralPhotos = collateral,
+        -- photoNotFound too (2026-10-07), matching batchAddKeywords: a pair that was asked for and not acted on is
+        -- never "complete" -- ids from another catalog would otherwise read as done (see _photoById: no uuid).
+        complete = counts.stillPresent == 0 and counts.unverified == 0 and counts.photoNotFound == 0
+            and #collateral == 0,
+        writeRan = writeRan,
+        writeError = (not okWrite) and tostring(writeErr) or nil,
+        results = results,
+    }))
+end
+
+-- Pure: of the keyword TREE, the keywords whose localIdentifier is in the set `want`, as a map id -> keyword, in
+-- one walk. Unit-testable.
+function CatalogModule._keywordsInTreeById(keywords, want, found)
+    found = found or {}
+    if type(keywords) ~= "table" then return found end
+    for _, kw in ipairs(keywords) do
+        if kw.localIdentifier ~= nil and want[kw.localIdentifier] then found[kw.localIdentifier] = kw end
+        if kw.getChildren then CatalogModule._keywordsInTreeById(kw:getChildren(), want, found) end
+    end
+    return found
+end
+
+-- catalog.batchAddKeywords -- the mirror of batchRemoveKeywords (2026-10-06): add EXISTING keywords, by
+-- localIdentifier, to photos: up to 200 {photoId, keywordId} pairs per call, in ONE write transaction. It never
+-- creates a keyword -- an id that is not in the keyword tree is keyword_not_found -- unlike `batch-set --keyword`,
+-- which matches by NAME and creates the keyword (export off, wherever LrC puts a parentless one) when the name is
+-- missing. Every pair's outcome comes from reads: on the photo BEFORE the write and AFTER it, so a write that never
+-- ran or an add LrC ignored reports not_added -- never added; a keyword list that cannot be read reports unverified;
+-- if a photo's keyword COUNT changed by anything other than what was added to it, the photo is in collateralPhotos.
+-- Optional catalogPath: refuse unless the open catalog is that file (photo and keyword ids are per-catalog). No
+-- write transaction when nothing needs adding. Catalog only: files change on Save Metadata (or by auto-write).
+-- Response: requested, added, alreadyOnPhoto, photoNotFound, keywordNotFound, notAdded, unverified,
+-- collateralPhotos, complete, writeRan, writeError, results[{photoId, keywordId, status}].
+-- complete == (notAdded, unverified, keywordNotFound and photoNotFound all 0, and no collateralPhotos).
+-- Reviewed independently 2026-10-06; its findings are folded in.
+function CatalogModule.batchAddKeywords(params, callback)
+    ensureLrModules()
+    local groups, n, perr = CatalogModule._groupKeywordPairs(params and params.pairs, 200)
+    if not groups then
+        local list = params and params.pairs
+        local code = "MISSING_PARAM"  -- absent, not a table, or empty
+        if n then
+            code = "BATCH_SIZE_EXCEEDED"
+        elseif type(list) == "table" and #list > 0 then
+            code = "INVALID_PARAM_VALUE"
+        end
+        callback(ErrorUtils.createError(code, perr))
+        return
+    end
+    local catalog = LrApplication.activeCatalog()
+    if params.catalogPath ~= nil then
+        local okPath, open = ErrorUtils.safeCall(function() return catalog:getPath() end)
+        if not okPath or not CatalogModule._samePath(open, params.catalogPath) then
+            callback(ErrorUtils.createError("WRONG_CATALOG", "Open catalog is '" .. tostring(open)
+                .. "', expected '" .. tostring(params.catalogPath) .. "' -- nothing changed"))
+            return
+        end
+    end
+    local wantIds = {}
+    for _, g in ipairs(groups) do
+        for _, kid in ipairs(g.keywordIds) do wantIds[kid] = true end
+    end
+
+    -- state[photoId] = { row = {keywordId -> on the photo?}, count = n } | { unreadable = true } ; absent = not found
+    local function snapshot()
+        local state = {}
+        catalog:withReadAccessDo(function()
+            for _, g in ipairs(groups) do
+                local photo, lookupErr = CatalogModule._photoById(catalog, g.photoId)
+                if lookupErr then
+                    state[g.photoId] = { unreadable = true }   -- a failed lookup is not a missing photo
+                elseif photo then
+                    local kws = photo:getRawMetadata("keywords")
+                    if type(kws) ~= "table" then
+                        state[g.photoId] = { unreadable = true }
+                    else
+                        local found = CatalogModule._keywordsById(kws, g.keywordIds)
+                        local row = {}
+                        for _, kid in ipairs(g.keywordIds) do row[kid] = found[kid] ~= nil end
+                        state[g.photoId] = { row = row, count = #kws }
+                    end
+                end
+            end
+        end)
+        return state
+    end
+
+    local okBefore, before, tree = ErrorUtils.safeCall(function()
+        local s = snapshot()
+        local t
+        catalog:withReadAccessDo(function() t = CatalogModule._keywordsInTreeById(catalog:getKeywords(), wantIds) end)
+        return s, t
+    end)
+    if not okBefore then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Could not read the photos' keywords: " .. tostring(before)))
+        return
+    end
+
+    local anyNeeded = false
+    for _, g in ipairs(groups) do
+        local b = before[g.photoId]
+        if b and b.row then
+            for _, kid in ipairs(g.keywordIds) do
+                if tree[kid] and not b.row[kid] then anyNeeded = true end
+            end
+        end
+    end
+
+    local writeRan, okWrite, writeErr = false, true, nil
+    if anyNeeded then
+        okWrite, writeErr = ErrorUtils.safeCall(function()
+            catalog:withWriteAccessDo("Batch Add Keywords", function()
+                writeRan = true
+                -- Re-resolve the keyword objects inside the write, as batch-set does (proven live).
+                local live = CatalogModule._keywordsInTreeById(catalog:getKeywords(), wantIds)
+                for _, g in ipairs(groups) do
+                    local b = before[g.photoId]
+                    if b and b.row then
+                        local photo = CatalogModule._photoById(catalog, g.photoId)   -- nil if it vanished
+                        for _, kid in ipairs(g.keywordIds) do
+                            if photo and live[kid] and not b.row[kid] then photo:addKeyword(live[kid]) end
+                        end
+                    end
+                end
+            end, { timeout = 60 })
+        end)
+    end
+
+    local okAfter, after = ErrorUtils.safeCall(snapshot)
+    local counts = { added = 0, alreadyOnPhoto = 0, photoNotFound = 0, keywordNotFound = 0, notAdded = 0,
+                     unverified = 0 }
+    local results, collateral = {}, {}
+    for _, g in ipairs(groups) do
+        local b = before[g.photoId]
+        local a = okAfter and after[g.photoId] or nil
+        local addedHere = 0
+        for _, kid in ipairs(g.keywordIds) do
+            local status
+            if not b then
+                status = "photo_not_found"; counts.photoNotFound = counts.photoNotFound + 1
+            elseif not b.row then
+                status = "unverified"; counts.unverified = counts.unverified + 1
+            elseif b.row[kid] then   -- before keyword_not_found: the photo's own list proves the keyword exists
+                status = "already_on_photo"; counts.alreadyOnPhoto = counts.alreadyOnPhoto + 1
+            elseif not tree[kid] then
+                status = "keyword_not_found"; counts.keywordNotFound = counts.keywordNotFound + 1
+            elseif not a or not a.row then
+                status = "unverified"; counts.unverified = counts.unverified + 1
+            elseif a.row[kid] then
+                status = "added"; counts.added = counts.added + 1; addedHere = addedHere + 1
+            else
+                status = "not_added"; counts.notAdded = counts.notAdded + 1
+            end
+            table.insert(results, { photoId = g.photoId, keywordId = kid, status = status })
+        end
+        if b and b.row and a and a.row and a.count ~= b.count + addedHere then
+            table.insert(collateral, g.photoId)
+        end
+    end
+    callback(ErrorUtils.createSuccess({
+        requested = n,
+        added = counts.added,
+        alreadyOnPhoto = counts.alreadyOnPhoto,
+        photoNotFound = counts.photoNotFound,
+        keywordNotFound = counts.keywordNotFound,
+        notAdded = counts.notAdded,
+        unverified = counts.unverified,
+        collateralPhotos = collateral,
+        -- Unlike batchRemoveKeywords, a photo that is not there makes the run incomplete: a tag that was asked for
+        -- did not land (ids from the wrong catalog would otherwise read as "complete" -- review 2026-10-06).
+        complete = counts.notAdded == 0 and counts.unverified == 0 and counts.keywordNotFound == 0
+            and counts.photoNotFound == 0 and #collateral == 0,
+        writeRan = writeRan,
+        writeError = (not okWrite) and tostring(writeErr) or nil,
+        results = results,
+    }))
+end
+
+-- Pure: return a keyword in `siblings`, other than `target`, whose name equals `newName` ignoring case.
+-- LrC enforces a unique (parent, lower-cased name) index on keywords, so renaming onto such a name would
+-- fail inside the write transaction. De-dating makes this likely ("2006_05_29 Wedding" -> "Wedding"). Unit-testable.
+function CatalogModule._findSiblingNameClash(siblings, target, newName)
+    if type(siblings) ~= "table" or type(newName) ~= "string" then return nil end
+    local want = newName:lower()
+    local targetId = target and target.localIdentifier
+    for _, kw in ipairs(siblings) do
+        if kw.localIdentifier ~= targetId then
+            local name = kw:getName()
+            if type(name) == "string" and name:lower() == want then
+                return kw
+            end
+        end
+    end
+    return nil
+end
+
+-- Pure: the temporary name a case-only rename passes through. It must differ from the target ignoring case,
+-- or LrC would ignore the first write too. Unit-testable.
+function CatalogModule._caseOnlyTempName(newName)
+    return newName .. " (rename in progress)"
+end
+
+-- Rename a keyword by its localIdentifier. Renaming via setAttributes keeps the same
+-- keyword object, so its photo links and face links are untouched -- only the name string
+-- changes. Synonyms are read first and passed back so they are preserved. Catalog only:
+-- the files' XMP picks up the new name on Save Metadata (Ctrl+S in LrC).
+-- LrC silently ignores a CASE-ONLY change (it compares with the stored lower-cased name; proven live
+-- 2026-10-01), so a case-only rename goes through a temporary name in two writes.
+function CatalogModule.renameKeyword(params, callback)
+    ensureLrModules()
+    params = params or {}
+    if params.keywordId == nil or params.newName == nil then
+        callback(ErrorUtils.createError("MISSING_PARAM", "keywordId and newName are required"))
+        return
+    end
+    local keywordId = tonumber(params.keywordId)
+    if not keywordId then
+        callback(ErrorUtils.createError("INVALID_PARAM", "keywordId must be a number"))
+        return
+    end
+    local newName = params.newName
+    if type(newName) ~= "string" or newName:match("^%s*$") or newName:find("[\r\n\t]")
+        or newName:find("^%s") or newName:find("%s$") then
+        callback(ErrorUtils.createError("INVALID_PARAM_VALUE",
+            "newName must be non-blank, without leading/trailing spaces, tabs or line breaks"))
+        return
+    end
+    local catalog = LrApplication.activeCatalog()
+    local opResult, opError = nil, nil
+    local tempName = CatalogModule._caseOnlyTempName(newName)
+    -- Set once a case-only rename's first write (to tempName) has committed, so ANY later failure -- a write
+    -- that never runs OR one that throws -- tells the caller the keyword is parked under tempName.
+    local halfway = false
+    local halfwayHint = "case-only rename stopped halfway: the keyword is now named '" .. tempName
+        .. "'. Re-run the same rename to finish it."
+    local writeSuccess, writeErr = ErrorUtils.safeCall(function()
+        -- 1. Resolve the keyword, its synonyms, and any sibling already holding newName -- or, for a case-only
+        --    rename, the temporary name (read txn).
+        local target, oldName, synonyms, clash, tempClash
+        catalog:withReadAccessDo(function()
+            target = CatalogModule._findKeywordById(catalog:getKeywords(), keywordId)
+            if target then
+                oldName = target:getName()
+                synonyms = target:getSynonyms()
+                local parent = target:getParent()  -- [SDK-VERIFY] nil (or the hidden root) for a top-level keyword
+                local siblings
+                if parent then
+                    siblings = parent:getChildren()
+                else
+                    siblings = catalog:getKeywords()
+                end
+                clash = CatalogModule._findSiblingNameClash(siblings, target, newName)
+                tempClash = CatalogModule._findSiblingNameClash(siblings, target, tempName)
+            end
+        end)
+        if not target then
+            opError = { code = "KEYWORD_NOT_FOUND", message = "Keyword id " .. tostring(keywordId) .. " not found" }
+            return
+        end
+        if oldName == newName then
+            opResult = { keywordId = keywordId, oldName = oldName, newName = newName, message = "No change (name already matches)" }
+            return
+        end
+        if clash then
+            opError = {
+                code = "KEYWORD_EXISTS",
+                message = "A sibling keyword is already named '" .. tostring(clash:getName())
+                    .. "' (id " .. tostring(clash.localIdentifier) .. ")",
+            }
+            return
+        end
+        local caseOnly = oldName:lower() == newName:lower()
+        if caseOnly and tempClash then
+            opError = {
+                code = "KEYWORD_EXISTS",
+                message = "Case-only rename needs the temporary name '" .. tempName .. "', but a sibling has it (id "
+                    .. tostring(tempClash.localIdentifier) .. ")",
+            }
+            return
+        end
+        -- 2. Rename via setAttributes; pass synonyms back so they are preserved (write txn). `written` is set
+        --    INSIDE the closure so a write that never runs (lock timeout) cannot report success.
+        local function writeName(name, actionName)
+            local attrs = { keywordName = name }
+            if synonyms ~= nil then attrs.synonyms = synonyms end
+            local written = false
+            catalog:withWriteAccessDo(actionName, function()
+                target:setAttributes(attrs)
+                written = true
+            end, { timeout = 15 })
+            return written
+        end
+        if caseOnly then
+            if not writeName(tempName, "Rename Keyword (1/2)") then
+                opError = { code = "OPERATION_FAILED", message = "Rename did not run (catalog busy or write timed out)" }
+                return
+            end
+            halfway = true
+        end
+        if not writeName(newName, caseOnly and "Rename Keyword (2/2)" or "Rename Keyword") then
+            if caseOnly then
+                opError = { code = "OPERATION_FAILED", message = "Write 2 of 2 did not run: " .. halfwayHint }
+            else
+                opError = { code = "OPERATION_FAILED", message = "Rename did not run (catalog busy or write timed out)" }
+            end
+            return
+        end
+        halfway = false
+        -- 3. Read back the stored name in its own safeCall + read txn: the write already committed, so a failed
+        --    read must not turn it into an error (verified = false), and a name LrC did not store must not
+        --    report success.
+        local storedName = nil
+        ErrorUtils.safeCall(function()
+            catalog:withReadAccessDo(function()
+                storedName = target:getName()
+            end)
+        end)
+        if storedName ~= nil and storedName ~= newName then
+            opError = { code = "OPERATION_FAILED", message = "Rename did not take: stored name is '" .. tostring(storedName) .. "'" }
+            return
+        end
+        opResult = {
+            keywordId = keywordId,
+            oldName = oldName,
+            newName = storedName or newName,
+            verified = storedName ~= nil,
+            message = "Keyword renamed",
+        }
+    end)
+    if opError then
+        callback(ErrorUtils.createError(opError.code, opError.message))
+    elseif writeSuccess and opResult then
+        callback(ErrorUtils.createSuccess(opResult))
+    else
+        local message = tostring(writeErr)
+        if halfway then message = message .. " -- " .. halfwayHint end
+        callback(ErrorUtils.createError("OPERATION_FAILED", message))
+    end
+end
+
+-- Pure: find a collection by localIdentifier among all collections (incl. nested in sets). Unit-testable.
+function CatalogModule._findCollectionById(node, collectionId)
+    if collectionId == nil then return nil end
+    for _, c in ipairs(CatalogModule._collectAllCollections(node)) do
+        if c.localIdentifier == collectionId then return c end
+    end
+    return nil
+end
+
+-- Pure: recursively collect every collection SET (descending through nested sets). Unit-testable.
+function CatalogModule._collectAllCollectionSets(node)
+    local result = {}
+    if node == nil then return result end
+    local function visit(n)
+        if n.getChildCollectionSets then
+            for _, s in ipairs(n:getChildCollectionSets()) do
+                table.insert(result, s)
+                visit(s)
+            end
+        end
+    end
+    visit(node)
+    return result
+end
+
+-- Pure: find a collection SET by localIdentifier. Unit-testable.
+function CatalogModule._findCollectionSetById(node, setId)
+    if setId == nil then return nil end
+    for _, s in ipairs(CatalogModule._collectAllCollectionSets(node)) do
+        if s.localIdentifier == setId then return s end
+    end
+    return nil
+end
+
+-- Pure: map CLI params -> Lightroom LR_* export settings. Unit-testable (no SDK calls).
+-- ORIGINAL/DNG are passthrough/raw (no re-encode). Resize applies to raster formats; the JPEG quality
+-- knob applies to JPEG only. Gating on a raster allow-list (not "~= ORIGINAL") keeps DNG from getting
+-- jpeg_quality/resize it can't use. [SDK-VERIFY] every LR_* key against live LrC.
+function CatalogModule._buildExportSettings(params)
+    local format = params.format or "ORIGINAL"
+    local RASTER = { JPEG = true, TIFF = true, PNG = true, PSD = true }
+    local settings = {
+        LR_export_destinationType = "specificFolder",
+        LR_export_destinationPathPrefix = params.dest,
+        LR_export_useSubfolder = false,
+        LR_format = format,
+        LR_reimportExportedPhoto = false,  -- keep exports OUT of the catalog (auto-XMP pipeline)
+        LR_collisionHandling = params.overwrite or "rename",
+    }
+    if RASTER[format] then
+        if format == "JPEG" and params.quality ~= nil then
+            settings.LR_jpeg_quality = tonumber(params.quality) / 100  -- [SDK-VERIFY] 0..1 scale
+        end
+        if params.resizeLongEdge ~= nil then
+            settings.LR_size_doConstrain = true
+            settings.LR_size_resizeType = "longEdge"
+            settings.LR_size_maxHeight = tonumber(params.resizeLongEdge)
+            settings.LR_size_maxWidth = tonumber(params.resizeLongEdge)
+            settings.LR_size_units = "pixels"
+        else
+            settings.LR_size_doConstrain = false
+        end
+    end
+    return settings
+end
+
+-- Export photos to disk via LrExportSession. Default ORIGINAL passthrough; partial-success per photo.
+-- Single callback always reached. Photo resolution under read access; render loop polls shouldAbort.
+function CatalogModule.exportPhotos(params, callback)
+    ensureLrModules()
+    params = params or {}
+    local dest = params.dest
+    if not dest or dest == "" then
+        callback(ErrorUtils.createError("MISSING_PARAM", "dest is required"))
+        return
+    end
+    if not LrFileUtils.exists(dest) then  -- [SDK-VERIFY] fail-fast, no auto-mkdir
+        callback(ErrorUtils.createError("DEST_NOT_FOUND", "Destination folder not found: " .. tostring(dest)))
+        return
+    end
+
+    local catalog = LrApplication.activeCatalog()
+    local photos, notFound = {}, {}
+    local resolveOk, resolveErr = ErrorUtils.safeCall(function()
+        catalog:withReadAccessDo(function()
+            if params.photoIds and type(params.photoIds) == "table" and #params.photoIds > 0 then
+                for _, pid in ipairs(params.photoIds) do
+                    local p = catalog:getPhotoByLocalId(tonumber(pid))
+                    if p then table.insert(photos, p) else table.insert(notFound, tostring(pid)) end
+                end
+            else
+                -- Selection fallback via the shared filmstrip-guard helper: nil target photo =>
+                -- empty (never the whole filmstrip). Same guard as getSelectedPhotos.
+                photos = CatalogModule._resolveSelection(catalog:getTargetPhoto(), catalog:getTargetPhotos())
+            end
+        end)
+    end)
+    if not resolveOk then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to resolve photos: " .. tostring(resolveErr)))
+        return
+    end
+    if #photos == 0 then
+        callback(ErrorUtils.createError("PHOTO_NOT_FOUND", "No photos to export (empty selection and no valid photoIds)"))
+        return
+    end
+
+    local exportSettings = CatalogModule._buildExportSettings(params)
+    local requestId = params._requestId
+    local command = params._command or "catalog.exportPhotos"
+    local router = getCommandRouter()
+    local continueOnError = params.continueOnError
+    if continueOnError == nil then continueOnError = true end
+
+    local results, exported, failed, incomplete = {}, 0, 0, false
+    local processed = {}
+    local renderOk, renderErr = ErrorUtils.safeCall(function()
+        local session = LrExportSession({  -- [SDK-VERIFY] constructor signature
+            photosToExport = photos,
+            exportSettings = exportSettings,
+        })
+        for _, rendition in session:renditions() do  -- [SDK-VERIFY] canonical LrExportSession iterator
+            if router and requestId and router:shouldAbort(requestId, command) then
+                incomplete = true
+                break
+            end
+            if rendition and rendition.photo then  -- defensive: skip a malformed rendition, don't crash the batch
+                local pid = tostring(rendition.photo.localIdentifier)
+                processed[pid] = true
+                local ok, pathOrMessage = rendition:waitForRender()  -- [SDK-VERIFY] (success, pathOrMessage)
+                if ok then
+                    exported = exported + 1
+                    table.insert(results, { photoId = pid, outputPath = pathOrMessage, success = true })
+                else
+                    failed = failed + 1
+                    table.insert(results, { photoId = pid, outputPath = nil, success = false, error = tostring(pathOrMessage) })
+                    if not continueOnError then incomplete = true; break end
+                end
+                LrTasks.yield()
+            end
+        end
+    end)
+    if not renderOk then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Export session failed: " .. tostring(renderErr)))
+        return
+    end
+
+    -- Resolved photos that were never rendered (aborted, stopped-on-error, or a malformed rendition) are
+    -- reported as failed rows so the accounting reflects every requested photo, not just the ones attempted.
+    for _, photo in ipairs(photos) do
+        local pid = tostring(photo.localIdentifier)
+        if not processed[pid] then
+            failed = failed + 1
+            table.insert(results, { photoId = pid, outputPath = nil, success = false,
+                error = incomplete and "Not rendered (export stopped early)" or "Not rendered" })
+        end
+    end
+
+    -- Photo IDs that never resolved to a catalog photo are reported as failed rows (honest count)
+    for _, pid in ipairs(notFound) do
+        failed = failed + 1
+        table.insert(results, { photoId = pid, outputPath = nil, success = false, error = "Photo not found" })
+    end
+
+    callback(ErrorUtils.createSuccess({
+        dest = dest,
+        format = params.format or "ORIGINAL",
+        results = results,
+        exported = exported,
+        failed = failed,
+        total = #results,
+        incomplete = incomplete,
+    }))
+end
+
+-- Shared core for add/remove collection membership. Mirrors removeKeyword's callback-once template.
+function CatalogModule._mutateCollectionMembership(params, callback, verb, actionName)
+    ensureLrModules()
+    params = params or {}
+    if params.collectionId == nil then
+        callback(ErrorUtils.createError("MISSING_PARAM", "collectionId is required"))
+        return
+    end
+    local collectionId = tonumber(params.collectionId)
+    if not collectionId then
+        callback(ErrorUtils.createError("INVALID_PARAM", "collectionId must be a number"))
+        return
+    end
+    local photoIds = params.photoIds
+    if type(photoIds) ~= "table" or #photoIds == 0 then
+        callback(ErrorUtils.createError("INVALID_PARAM_VALUE", "photoIds must be a non-empty array"))
+        return
+    end
+
+    local catalog = LrApplication.activeCatalog()
+    local collection, collectionName = nil, nil
+    local photos, notFound = {}, {}
+    local mutable = false
+
+    -- 1. Resolve the collection + photos under READ access. Resolving/reading collection info must NOT
+    -- share the withWriteAccessDo that mutates it -- the LrC SDK forbids same-txn read-after-write.
+    local resolveOk, resolveErr = ErrorUtils.safeCall(function()
+        catalog:withReadAccessDo(function()
+            collection = CatalogModule._findCollectionById(catalog, collectionId)
+            if collection then
+                collectionName = collection:getName()
+                mutable = type(collection.addPhotos) == "function" and type(collection.removePhotos) == "function"
+                for _, pid in ipairs(photoIds) do
+                    local p = catalog:getPhotoByLocalId(tonumber(pid))
+                    if p then table.insert(photos, p) else table.insert(notFound, tostring(pid)) end
+                end
+            end
+        end)
+    end)
+    if not resolveOk then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to resolve collection: " .. tostring(resolveErr)))
+        return
+    end
+    if not collection then
+        callback(ErrorUtils.createError("PHOTO_NOT_FOUND", "Collection not found: " .. tostring(collectionId)))
+        return
+    end
+    if not mutable then
+        callback(ErrorUtils.createError("NOT_SUPPORTED", "Collection does not support membership changes (smart collection?)"))
+        return
+    end
+    if #photos == 0 then
+        callback(ErrorUtils.createError("PHOTO_NOT_FOUND", "No photos found with the provided IDs"))
+        return
+    end
+
+    -- 2. Mutate membership under WRITE access.
+    local writeOk, writeErr = ErrorUtils.safeCall(function()
+        catalog:withWriteAccessDo(actionName, function()
+            if verb == "add" then
+                collection:addPhotos(photos)  -- [SDK-VERIFY]
+            else
+                collection:removePhotos(photos)  -- [SDK-VERIFY]
+            end
+        end, { timeout = 10 })
+    end)
+    if not writeOk then
+        callback(ErrorUtils.createError("OPERATION_FAILED", "Failed to update collection membership: " .. tostring(writeErr)))
+        return
+    end
+
+    -- 3. Read the post-commit membership count under READ access (separate txn -> accurate count).
+    local photoCount = nil
+    ErrorUtils.safeCall(function()
+        catalog:withReadAccessDo(function()
+            photoCount = #collection:getPhotos()
+        end)
+    end)
+
+    callback(ErrorUtils.createSuccess({
+        collectionId = collectionId,
+        collectionName = collectionName,
+        photoCount = photoCount,
+        requested = #photoIds,
+        affected = #photos,
+        notFound = (#notFound > 0) and notFound or nil,
+    }))
+end
+
+function CatalogModule.addPhotosToCollection(params, callback)
+    CatalogModule._mutateCollectionMembership(params, callback, "add", "Add Photos to Collection")
+end
+
+function CatalogModule.removePhotosFromCollection(params, callback)
+    CatalogModule._mutateCollectionMembership(params, callback, "remove", "Remove Photos from Collection")
+end
+
 function CatalogModule.setViewFilter(params, callback)
     ensureLrModules()
     local filter = params.filter or {}
@@ -1749,28 +3858,24 @@ function CatalogModule.getCurrentViewFilter(params, callback)
 end
 
 function CatalogModule.removeFromCatalog(params, callback)
-    ensureLrModules()
-    local photoId = params.photoId
+    -- The Lightroom Classic SDK provides no API to remove a photo from the
+    -- catalog: LrCatalog has no removePhoto/removePhotos method -- removal is a
+    -- UI-only action (Photo > Remove Photo from Catalog). The previous code
+    -- called catalog:removePhoto(photo), a nil method, so this verb always
+    -- failed with a cryptic OPERATION_FAILED (caught by safeCall). Short-circuit
+    -- with an honest capability error instead of entering a write transaction
+    -- for an operation that can never succeed.
+    -- Source: lr CLI bridge Lua bug audit, 2026-06-12.
+    local photoId = params and params.photoId
     if not photoId then
-        callback(ErrorUtils.createError("MISSING_PARAM", "Photo ID is required"))
+        callback(ErrorUtils.createError(ErrorUtils.CODES.MISSING_PARAM, "Photo ID is required"))
         return
     end
-    local catalog = LrApplication.activeCatalog()
-    catalog:withWriteAccessDo("Remove From Catalog", function()
-        local photo = catalog:getPhotoByLocalId(tonumber(photoId))
-        if not photo then
-            callback(ErrorUtils.createError("PHOTO_NOT_FOUND", "Photo not found"))
-            return
-        end
-        local success, err = ErrorUtils.safeCall(function()
-            catalog:removePhoto(photo)
-        end)
-        if success then
-            callback(ErrorUtils.createSuccess({ photoId = photoId, message = "Photo removed from catalog" }))
-        else
-            callback(ErrorUtils.createError("OPERATION_FAILED", tostring(err)))
-        end
-    end, { timeout = 10 })
+    callback(ErrorUtils.createError(
+        ErrorUtils.CODES.NOT_SUPPORTED,
+        "Removing a photo from the catalog is not supported by the Lightroom SDK. "
+        .. "Remove it manually in Lightroom (Photo > Remove Photo from Catalog)."
+    ))
 end
 
 -- Get photos from a specific collection by ID
@@ -1789,7 +3894,7 @@ function CatalogModule.getCollectionPhotos(params, callback)
         return
     end
 
-    local limit = params.limit or DEFAULT_PAGE_SIZE
+    local limit = math.min(math.max(tonumber(params.limit) or DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE)
     local offset = math.max(params.offset or 0, 0)
 
     logger:debug("Getting photos from collection: " .. tostring(collectionId))
@@ -1799,8 +3904,7 @@ function CatalogModule.getCollectionPhotos(params, callback)
     -- Find the collection by ID
     local targetCollection = nil
     catalog:withReadAccessDo(function()
-        local collections = catalog:getChildCollections()
-        for _, collection in ipairs(collections) do
+        for _, collection in ipairs(CatalogModule._collectAllCollections(catalog)) do
             if collection.localIdentifier == collectionId then
                 targetCollection = collection
                 break

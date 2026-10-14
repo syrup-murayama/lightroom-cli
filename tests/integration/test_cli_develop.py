@@ -28,6 +28,55 @@ def test_develop_get_settings(mock_get_bridge, runner):
 
 
 @patch("cli.helpers.get_bridge")
+def test_develop_batch_apply(mock_get_bridge, runner):
+    """lr develop batch-apply applies settings (Param=Value) to multiple photos."""
+    mock_bridge = AsyncMock()
+    mock_bridge.send_command.return_value = {"id": "x", "success": True, "result": {}}
+    mock_get_bridge.return_value = mock_bridge
+    result = runner.invoke(
+        cli, ["develop", "batch-apply", "1", "2", "--set", "Exposure=0.5", "--set", "Contrast=20"]
+    )
+    assert result.exit_code == 0
+    mock_bridge.send_command.assert_called_once_with(
+        "develop.batchApplySettings",
+        {"settings": {"Exposure": 0.5, "Contrast": 20.0}, "photoIds": ["1", "2"]},
+        timeout=60.0,
+    )
+
+
+def test_develop_batch_apply_requires_settings(runner):
+    """batch-apply with no --set is a usage error (exit != 0)."""
+    result = runner.invoke(cli, ["develop", "batch-apply", "1"])
+    assert result.exit_code != 0
+
+
+@patch("cli.helpers.get_bridge")
+def test_develop_mask_create(mock_get_bridge, runner):
+    """lr develop mask create sends maskType to develop.createNewMask."""
+    mock_bridge = AsyncMock()
+    mock_bridge.send_command.return_value = {"id": "x", "success": True, "result": {}}
+    mock_get_bridge.return_value = mock_bridge
+    result = runner.invoke(cli, ["develop", "mask", "create", "--type", "radialGradient"])
+    assert result.exit_code == 0
+    mock_bridge.send_command.assert_called_once_with(
+        "develop.createNewMask", {"maskType": "radialGradient"}, timeout=30.0
+    )
+
+
+@patch("cli.helpers.get_bridge")
+def test_develop_mask_ai(mock_get_bridge, runner):
+    """lr develop mask ai sends selectionType to develop.createAISelectionMask."""
+    mock_bridge = AsyncMock()
+    mock_bridge.send_command.return_value = {"id": "x", "success": True, "result": {}}
+    mock_get_bridge.return_value = mock_bridge
+    result = runner.invoke(cli, ["develop", "mask", "ai", "--selection", "sky"])
+    assert result.exit_code == 0
+    mock_bridge.send_command.assert_called_once_with(
+        "develop.createAISelectionMask", {"selectionType": "sky"}, timeout=30.0
+    )
+
+
+@patch("cli.helpers.get_bridge")
 def test_develop_set_single_param(mock_get_bridge, runner):
     """lr develop set Exposure 1.5 が単一パラメータを設定する"""
     mock_bridge = AsyncMock()
@@ -62,6 +111,32 @@ def test_develop_set_multiple_params(mock_get_bridge, runner):
     calls = mock_bridge.send_command.call_args_list
     assert calls[0].args == ("develop.setValue", {"param": "Exposure", "value": 1.5})
     assert calls[1].args == ("develop.setValue", {"param": "Contrast", "value": 25.0})
+
+
+@patch("cli.helpers.get_bridge")
+def test_develop_set_boolean(mock_get_bridge, runner):
+    """lr develop set ConvertToGrayscale true sends a real boolean (#116)."""
+    mock_bridge = AsyncMock()
+    mock_bridge.send_command.return_value = {"id": "x", "success": True, "result": {}}
+    mock_get_bridge.return_value = mock_bridge
+    result = runner.invoke(cli, ["develop", "set", "ConvertToGrayscale", "true"])
+    assert result.exit_code == 0
+    mock_bridge.send_command.assert_called_once_with(
+        "develop.setValue", {"param": "ConvertToGrayscale", "value": True}, timeout=30.0
+    )
+
+
+@patch("cli.helpers.get_bridge")
+def test_develop_set_string(mock_get_bridge, runner):
+    """lr develop set WhiteBalance Auto sends a string (#116)."""
+    mock_bridge = AsyncMock()
+    mock_bridge.send_command.return_value = {"id": "x", "success": True, "result": {}}
+    mock_get_bridge.return_value = mock_bridge
+    result = runner.invoke(cli, ["develop", "set", "WhiteBalance", "Auto"])
+    assert result.exit_code == 0
+    mock_bridge.send_command.assert_called_once_with(
+        "develop.setValue", {"param": "WhiteBalance", "value": "Auto"}, timeout=30.0
+    )
 
 
 @patch("cli.helpers.get_bridge")
@@ -294,25 +369,13 @@ class TestParsePairsErrorHandling:
     def runner(self):
         return CliRunner()
 
-    def test_invalid_numeric_value_shows_structured_error(self, runner):
-        """lr develop set Exposure abc が構造化エラーを返す（traceback なし）"""
-        result = runner.invoke(cli, ["-o", "json", "develop", "set", "Exposure", "abc"])
-        assert result.exit_code == 2
-        assert "Traceback" not in result.output
-        error_output = result.output if result.output else ""
-        stderr_output = result.stderr if hasattr(result, "stderr") else ""
-        combined = error_output + stderr_output
-        assert "VALIDATION_ERROR" in combined or "Invalid numeric value" in combined
-
     def test_odd_number_of_args_shows_error(self, runner):
-        """lr develop set Exposure が構造化エラーを返す"""
-        result = runner.invoke(cli, ["-o", "json", "develop", "set", "Exposure"])
-        assert result.exit_code == 2
-        assert "Traceback" not in result.output
+        """lr develop set Exposure (odd pair) が構造化エラーを返す。
 
-    def test_special_chars_in_value_show_error(self, runner):
-        """特殊文字が値の場合のエラーハンドリング"""
-        result = runner.invoke(cli, ["-o", "json", "develop", "set", "Exposure", "!@#"])
+        非数値の単一値 (abc / !@#) は #116 で許容に変更（SCALAR）したため、
+        ここでは pair 不一致のみをエラーとして検証する。
+        """
+        result = runner.invoke(cli, ["-o", "json", "develop", "set", "Exposure"])
         assert result.exit_code == 2
         assert "Traceback" not in result.output
 

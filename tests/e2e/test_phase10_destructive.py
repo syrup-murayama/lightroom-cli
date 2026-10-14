@@ -30,9 +30,15 @@ class TestDestructiveEditInPhotoshop:
     """Test 123: Edit in Photoshop (opens external app)."""
 
     def test_edit_in_photoshop(self, run):
-        """Test 123: Open photo in Photoshop."""
+        """Test 123: edit-in-photoshop reports NOT_SUPPORTED.
+
+        LrPhoto has no openInPhotoshop() method, so the verb cannot succeed via
+        the SDK; it now fails honestly (success=false -> non-zero exit) instead
+        of the old generic EDIT_FAILED. (The prior `== 0` assertion never held —
+        the underlying call did not exist.)
+        """
         r = run("develop", "edit-in-photoshop")
-        assert r["exit_code"] == 0, f"edit-in-photoshop failed: {r['output']}"
+        assert r["exit_code"] != 0, f"expected NOT_SUPPORTED non-zero exit: {r['output']}"
 
 
 @pytest.mark.e2e
@@ -41,14 +47,16 @@ class TestDestructiveRemoveFromCatalog:
     """Test 124: Remove photo from catalog (IRREVERSIBLE)."""
 
     def test_remove_from_catalog(self, run, e2e_state):
-        """Test 124: Remove photo from catalog.
+        """Test 124: remove-from-catalog reports NOT_SUPPORTED (no longer destructive).
 
-        WARNING: This permanently removes the photo from the catalog.
-        Only run with a disposable test photo.
+        Catalog photo removal is UI-only in the LrC SDK (LrCatalog has no
+        removePhoto), so the verb now fails honestly (success=false -> non-zero
+        exit) without touching the catalog, rather than the old cryptic
+        OPERATION_FAILED. It no longer removes anything.
         """
         assert e2e_state.photo_id is not None, "photo_id not set"
         r = run("catalog", "remove-from-catalog", e2e_state.photo_id)
-        assert r["exit_code"] == 0, f"remove-from-catalog failed: {r['output']}"
+        assert r["exit_code"] != 0, f"expected NOT_SUPPORTED non-zero exit: {r['output']}"
 
 
 @pytest.mark.e2e
@@ -103,7 +111,10 @@ class TestDestructiveCreateKeyword:
     def test_create_keyword(self, run):
         """Test 129: Create keyword '_e2e_kw'."""
         r = run("catalog", "create-keyword", "_e2e_kw")
-        assert r["exit_code"] == 0, f"create-keyword failed: {r['output']}"
+        # The SDK cannot delete keywords, so `_e2e_kw` survives the first run; with no parent Lightroom puts it under
+        # the last-selected keyword, and since 2026-10-06 a later run is refused as KEYWORD_EXISTS_ELSEWHERE (unless
+        # it happens to be at the top level, then created=false). Either outcome proves the command works.
+        assert r["exit_code"] == 0 or "KEYWORD_EXISTS_ELSEWHERE" in r["output"], f"create-keyword failed: {r['output']}"
 
 
 @pytest.mark.e2e

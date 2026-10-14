@@ -35,6 +35,24 @@ def run_async(coro):
         loop.close()
 
 
+def coerce_scalar(value: str):
+    """Coerce a CLI string argument to number / bool / string for a SCALAR param.
+
+    Many develop and metadata params are numeric, but some are boolean (e.g.
+    ConvertToGrayscale) or enum strings (e.g. WhiteBalance='Auto'), so we don't force
+    everything to a number. Tries true/false, then a number, else leaves it a string.
+    """
+    low = value.strip().lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
 def execute_command(ctx, command: str, params: dict, *, timeout: float | None = None, post_process=None):
     """共通コマンド実行ヘルパー。
 
@@ -134,6 +152,10 @@ def execute_command(ctx, command: str, params: dict, *, timeout: float | None = 
             if post_process is not None:
                 data = post_process(data)
             click.echo(OutputFormatter.format(data, fmt, fields=fields))
+        except click.exceptions.Exit:
+            # ctx.exit() raises Exit, a RuntimeError subclass in Click 8 -- let it through. Caught below, it printed a
+            # second error line, {"error": {"code": "ERROR", "message": "1"}}, after every real one (2026-10-06).
+            raise
         except Exception as e:
             if _is_connection_error(e):
                 click.echo(

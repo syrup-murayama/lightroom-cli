@@ -47,7 +47,12 @@ local ErrorUtils = {
         PHOTO_ACCESS_DENIED = "PHOTO_ACCESS_DENIED",
         CATALOG_ACCESS_FAILED = "CATALOG_ACCESS_FAILED",
         RESOURCE_UNAVAILABLE = "RESOURCE_UNAVAILABLE",
-        OPERATION_FAILED = "OPERATION_FAILED"
+        OPERATION_FAILED = "OPERATION_FAILED",
+        -- Keep in sync with the external ErrorUtils.lua CODES table. Modules
+        -- capture THIS built-in copy at load (via _G.LightroomPythonBridge.ErrorUtils),
+        -- so a capability code missing here silently degrades to "ERROR" in
+        -- production. Parity is guarded by tests/test_plugin_lua_unit.py.
+        NOT_SUPPORTED = "NOT_SUPPORTED"
     },
     
     safeCall = function(func, ...)
@@ -212,7 +217,10 @@ local function registerSystemCommands()
             result = {
                 pong = true,
                 timestamp = os.time(),
-                version = "1.2.1",
+                version = "1.3.1",
+                -- Bump with every plugin change: `lr system ping` then shows which code Lightroom has actually
+                -- loaded (a Reload Plug-in that did not take is otherwise invisible -- 2026-10-07).
+                build = "2026-10-07f",
                 protocolVersion = "1"
             }
         })
@@ -367,6 +375,11 @@ local function registerApiCommands()
     router:register("catalog.setRating", CatalogModule.setRating, "sync")
     router:register("catalog.addKeywords", CatalogModule.addKeywords, "sync")
     router:register("catalog.setFlag", CatalogModule.setFlag, "sync")
+    router:register("catalog.batchSetFlag", CatalogModule.batchSetFlag, "sync")
+    router:register("catalog.batchRemoveKeywords", CatalogModule.batchRemoveKeywords, "sync")
+    router:register("catalog.batchAddKeywords", CatalogModule.batchAddKeywords, "sync")
+    router:register("catalog.probePhoto", CatalogModule.probePhoto, "sync")
+    router:register("catalog.probeApi", CatalogModule.probeApi, "sync")
     router:register("catalog.getFlag", CatalogModule.getFlag, "sync")
     router:register("catalog.setTitle", CatalogModule.setTitle, "sync")
     router:register("catalog.setCaption", CatalogModule.setCaption, "sync")
@@ -383,14 +396,24 @@ local function registerApiCommands()
     router:register("catalog.createCollection", CatalogModule.createCollection, "sync")
     router:register("catalog.createSmartCollection", CatalogModule.createSmartCollection, "sync")
     router:register("catalog.createCollectionSet", CatalogModule.createCollectionSet, "sync")
+    router:register("catalog.renameCollection", CatalogModule.renameCollection, "sync")
+    router:register("catalog.deleteCollection", CatalogModule.deleteCollection, "sync")
     router:register("catalog.createKeyword", CatalogModule.createKeyword, "sync")
+    router:register("catalog.moveKeyword", CatalogModule.moveKeyword, "sync")
     router:register("catalog.removeKeyword", CatalogModule.removeKeyword, "sync")
+    router:register("catalog.renameKeyword", CatalogModule.renameKeyword, "sync")
     router:register("catalog.setViewFilter", CatalogModule.setViewFilter, "sync")
     router:register("catalog.getCurrentViewFilter", CatalogModule.getCurrentViewFilter, "sync")
     router:register("catalog.removeFromCatalog", CatalogModule.removeFromCatalog, "sync")
     router:register("catalog.getCollectionPhotos", CatalogModule.getCollectionPhotos, "sync")
     router:register("catalog.getDevelopPresets", CatalogModule.getDevelopPresets, "sync")
     router:register("catalog.getPath", CatalogModule.getPath, "sync")
+    router:register("catalog.exportPhotos", CatalogModule.exportPhotos, "sync")
+    router:register("catalog.addPhotosToCollection", CatalogModule.addPhotosToCollection, "sync")
+    router:register("catalog.removePhotosFromCollection", CatalogModule.removePhotosFromCollection, "sync")
+    router:register("catalog.batchSetMetadata", CatalogModule.batchSetMetadata, "sync")
+    router:register("catalog.saveMetadata", CatalogModule.saveMetadata, "sync")
+    router:register("catalog.importPhotos", CatalogModule.importPhotos, "sync")
 
     -- Preview module commands (registered as sync for catalog API access)
     Logger:info("Registering preview commands...")
